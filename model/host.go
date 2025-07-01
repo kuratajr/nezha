@@ -1,8 +1,9 @@
 package model
 
 import (
+	"database/sql/driver"
+	"encoding/json"
 	"fmt"
-
 	pb "github.com/nezhahq/nezha/proto"
 )
 
