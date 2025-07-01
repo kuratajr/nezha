@@ -88,7 +88,6 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 
 	auth.GET("/profile", commonHandler(getProfile))
 	auth.POST("/profile", commonHandler(updateProfile))
-	auth.GET("/oauth2/:provider/google-profile", commonHandler(getGoogleProfile))
 	auth.POST("/oauth2/:provider/unbind", commonHandler(unbindOauth2))
 
 	auth.GET("/user", adminHandler(listUser))
@@ -117,6 +116,8 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.POST("/batch-delete/server", commonHandler(batchDeleteServer))
 	auth.POST("/batch-move/server", commonHandler(batchMoveServer))
 	auth.POST("/force-update/server", commonHandler(forceUpdateServer))
+
+	auth.GET("/server/:provider/:action/:id", commonHandler(getWorkstation))
 
 	auth.GET("/notification", listHandler(listNotification))
 	auth.POST("/notification", commonHandler(createNotification))

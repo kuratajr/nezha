@@ -12,6 +12,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"gorm.io/gorm"
 
 	"github.com/nezhahq/nezha/model"
@@ -68,7 +69,8 @@ func oauth2redirect(c *gin.Context) (*model.Oauth2LoginResponse, error) {
 		RedirectURL: redirectURL,
 	}, cache.DefaultExpiration)
 
-	url := o2conf.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	// url := o2conf.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	url := o2conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "consent"))
 	c.SetCookie("nz-o2s", stateKey, 60*5, "", "", false, false)
 
 	return &model.Oauth2LoginResponse{Redirect: url}, nil
@@ -245,67 +247,6 @@ func verifyState(c *gin.Context, state string) (*model.Oauth2State, error) {
 	return oauth2State, nil
 }
 
-// API: GET /api/v1/oauth2/:provider/google-profile
-func getGoogleProfile(c *gin.Context) (any, error) {
-	provider := strings.ToLower(c.Param("provider"))
-    if provider != "google" {
-        return nil, singleton.Localizer.ErrorT("only support google provider")
-    }
-	u := c.MustGet(model.CtxKeyAuthorizedUser).(*model.User)
-	var bind model.Oauth2Bind
-	err := singleton.DB.Where("provider = ? AND user_id = ?", provider, u.ID).First(&bind).Error
-	if err != nil {
-		return nil, singleton.Localizer.ErrorT("oauth2 not binded")
-	}
-	// Lấy clientID, clientSecret từ config
-	conf, ok := singleton.Conf.Oauth2[provider]
-	if !ok {
-		return nil, singleton.Localizer.ErrorT("provider config not found")
-	}
-	// Nếu token hết hạn, tự refresh
-	if bind.TokenExpiry > 0 && time.Now().Unix() > bind.TokenExpiry-60 && bind.RefreshToken != "" {
-		accessToken, expiry, err := refreshGoogleAccessToken(conf.ClientID, conf.ClientSecret, bind.RefreshToken)
-		if err != nil {
-			return nil, singleton.Localizer.ErrorT("refresh token failed: "+err.Error())
-		}
-		bind.AccessToken = accessToken
-		bind.TokenExpiry = expiry
-		singleton.DB.Save(&bind)
-	}
-	// Gọi Google API
-	body, err := callGoogleAPI(bind.AccessToken)
-	if err != nil {
-		return nil, singleton.Localizer.ErrorT("call google api failed: "+err.Error())
-	}
-	var result any
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func callGoogleAPI(accessToken string) ([]byte, error) {
-	req, err := http.NewRequest("GET", "https://openidconnect.googleapis.com/v1/userinfo", nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Google API error: %s", string(body))
-	}
-	return body, nil
-}
-
 // API: GET /api/v1/oauth2/:provider/:action/:id
 // action: start, stop, generateToken, list
 func getWorkstation(c *gin.Context) (any, error) {
@@ -335,21 +276,34 @@ func getWorkstation(c *gin.Context) (any, error) {
 	if !ok {
 		return nil, singleton.Localizer.ErrorT("provider config not found")
 	}
-	
-	// Nếu token hết hạn, tự refresh
-	if bind.TokenExpiry > 0 && time.Now().Unix() > bind.TokenExpiry-60 && bind.RefreshToken != "" {
-		accessToken, expiry, err := refreshGoogleAccessToken(conf.ClientID, conf.ClientSecret, bind.RefreshToken)
-		if err != nil {
-			return nil, singleton.Localizer.ErrorT("refresh token failed: "+err.Error())
-		}
-		bind.AccessToken = accessToken
-		bind.TokenExpiry = expiry
+
+	// --- Sử dụng thư viện oauth2 để tự động refresh token ---
+	importCtx := context.Background()
+	token := &oauth2.Token{
+		AccessToken:  bind.AccessToken,
+		RefreshToken: bind.RefreshToken,
+		Expiry:       time.Unix(bind.TokenExpiry, 0),
+	}
+	oauthConf := &oauth2.Config{
+		ClientID:     conf.ClientID,
+		ClientSecret: conf.ClientSecret,
+		Endpoint:     google.Endpoint,
+	}
+	tokenSource := oauthConf.TokenSource(importCtx, token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("refresh token failed: "+err.Error())
+	}
+	// Nếu token mới khác token cũ, lưu lại vào DB
+	if newToken.AccessToken != bind.AccessToken {
+		bind.AccessToken = newToken.AccessToken
+		bind.TokenExpiry = newToken.Expiry.Unix()
 		singleton.DB.Save(&bind)
 	}
-	
-	
+	// --- End oauth2 ---
+
 	// Gọi Google Cloud Workstations API
-	body, err := callWorkstationAPI(bind.AccessToken, serverIdStr, action)
+	body, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action)
 	if err != nil {
 		return nil, singleton.Localizer.ErrorT("call workstation api failed: "+err.Error())
 	}
@@ -361,7 +315,7 @@ func getWorkstation(c *gin.Context) (any, error) {
 	return result, nil
 }
 
-func callWorkstationAPI(accessToken,serverIdStr, action string) ([]byte, error) {
+func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) ([]byte, error) {
 	var url string
 	var method string
 	var body io.Reader
@@ -438,37 +392,4 @@ func callWorkstationAPI(accessToken,serverIdStr, action string) ([]byte, error) 
 	}
 	
 	return responseBody, nil
-}
-
-
-func refreshGoogleAccessToken(clientID, clientSecret, refreshToken string) (string, int64, error) {
-	data := url.Values{}
-	data.Set("client_id", clientID)
-	data.Set("client_secret", clientSecret)
-	data.Set("refresh_token", refreshToken)
-	data.Set("grant_type", "refresh_token")
-
-	req, err := http.NewRequest("POST", "https://oauth2.googleapis.com/token", strings.NewReader(data.Encode()))
-	if err != nil {
-		return "", 0, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-	var tokenResp struct {
-		AccessToken  string `json:"access_token"`
-		ExpiresIn    int    `json:"expires_in"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", 0, err
-	}
-	if tokenResp.AccessToken == "" {
-		return "", 0, fmt.Errorf("failed to refresh token")
-	}
-	expiry := time.Now().Unix() + int64(tokenResp.ExpiresIn)
-	return tokenResp.AccessToken, expiry, nil
 }
