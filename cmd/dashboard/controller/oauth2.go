@@ -306,6 +306,141 @@ func callGoogleAPI(accessToken string) ([]byte, error) {
 	return body, nil
 }
 
+// API: GET /api/v1/oauth2/:provider/:action/:id
+// action: start, stop, generateToken, list
+func getWorkstation(c *gin.Context) (any, error) {
+	provider := strings.ToLower(c.Param("provider"))
+    if provider != "google" {
+        return nil, singleton.Localizer.ErrorT("only support google provider")
+    }
+	
+	action := c.Param("action")
+	serverIdStr := c.Param("id")
+	
+	// Validate action
+	validActions := map[string]bool{"start": true, "stop": true, "generateToken": true, "list": true}
+	if !validActions[action] {
+		return nil, singleton.Localizer.ErrorT("invalid action. Supported actions: start, stop, generateToken, list")
+	}
+	
+	u := c.MustGet(model.CtxKeyAuthorizedUser).(*model.User)
+	var bind model.Oauth2Bind
+	err := singleton.DB.Where("provider = ? AND user_id = ?", provider, u.ID).First(&bind).Error
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("oauth2 not binded")
+	}
+	
+	// Lấy clientID, clientSecret từ config
+	conf, ok := singleton.Conf.Oauth2[provider]
+	if !ok {
+		return nil, singleton.Localizer.ErrorT("provider config not found")
+	}
+	
+	// Nếu token hết hạn, tự refresh
+	if bind.TokenExpiry > 0 && time.Now().Unix() > bind.TokenExpiry-60 && bind.RefreshToken != "" {
+		accessToken, expiry, err := refreshGoogleAccessToken(conf.ClientID, conf.ClientSecret, bind.RefreshToken)
+		if err != nil {
+			return nil, singleton.Localizer.ErrorT("refresh token failed: "+err.Error())
+		}
+		bind.AccessToken = accessToken
+		bind.TokenExpiry = expiry
+		singleton.DB.Save(&bind)
+	}
+	
+	
+	// Gọi Google Cloud Workstations API
+	body, err := callWorkstationAPI(bind.AccessToken, serverIdStr, action)
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("call workstation api failed: "+err.Error())
+	}
+	
+	var result any
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func callWorkstationAPI(accessToken,serverIdStr, action string) ([]byte, error) {
+	var url string
+	var method string
+	var body io.Reader
+	
+	// Lấy thông tin từ server ID
+	serverId, err := strconv.ParseUint(serverIdStr, 10, 64)
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("invalid server id")
+	}
+	
+	var s model.Server
+	if err := singleton.DB.First(&s, serverId).Error; err != nil {
+		return nil, singleton.Localizer.ErrorT("server id %d does not exist", serverId)
+	}
+
+	if !s.HasPermission(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+	
+	serverUri := s.ConfigDetail.Name
+	baseURL := "https://workstations.googleapis.com/v1beta/" + serverUri
+	
+	switch action {
+	case "list":
+		url = baseURL
+		method = "GET"
+		body = nil
+
+		
+	case "start":
+		// Start workstation
+		url = fmt.Sprintf("%s:start", baseURL)
+		method = "POST"
+		body = nil
+		
+	case "stop":
+		// Stop workstation
+		url = fmt.Sprintf("%s:stop", baseURL)
+		method = "POST"
+		body = nil
+		
+	case "generateToken":
+		// Generate access token for workstation
+		url = fmt.Sprintf("%s:generateAccessToken", baseURL)
+		method = "POST"
+		body = nil
+		
+	default:
+		return nil, fmt.Errorf("unsupported action: %s", action)
+	}
+	
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Google Workstations API error (status %d): %s", resp.StatusCode, string(responseBody))
+	}
+	
+	return responseBody, nil
+}
+
+
 func refreshGoogleAccessToken(clientID, clientSecret, refreshToken string) (string, int64, error) {
 	data := url.Values{}
 	data.Set("client_id", clientID)
