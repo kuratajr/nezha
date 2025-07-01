@@ -20,7 +20,6 @@ import (
 	"github.com/nezhahq/nezha/pkg/utils"
 	"github.com/nezhahq/nezha/service/singleton"
 	"encoding/json"
-	"net/url"
 	"time"
 )
 
