@@ -104,7 +104,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+          password: ${{ secrets.GHCR }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
