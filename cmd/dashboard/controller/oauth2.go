@@ -392,7 +392,7 @@ func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) (
 		method = "POST"
 		body = nil
 		
-	case "generateToken":
+	case "token":
 		// Generate access token for workstation
 		url = fmt.Sprintf("%s:generateAccessToken", baseURL)
 		method = "POST"
