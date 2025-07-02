@@ -1,12 +1,17 @@
 package controller
 
 import (
+"slices"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-gonic/gin"
@@ -19,8 +24,6 @@ import (
 	"github.com/nezhahq/nezha/model"
 	"github.com/nezhahq/nezha/pkg/utils"
 	"github.com/nezhahq/nezha/service/singleton"
-	"encoding/json"
-	"time"
 )
 
 func getRedirectURL(c *gin.Context) string {
@@ -256,10 +259,19 @@ func getWorkstation(c *gin.Context) (any, error) {
     }
 	
 	action := c.Param("action")
-	serverIdStr := c.Param("id")
-	
+	// serverIdStr := c.Param("id")
+
+	var servers []uint64
+	if err := c.ShouldBindJSON(&servers); err != nil {
+		return nil, err
+	}
+
+	if !singleton.ServerShared.CheckPermission(c, slices.Values(servers)) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
 	// Validate action
-	validActions := map[string]bool{"start": true, "stop": true, "generateToken": true, "list": true}
+	validActions := map[string]bool{"start": true, "stop": true, "token": true, "list": true}
 	if !validActions[action] {
 		return nil, singleton.Localizer.ErrorT("invalid action. Supported actions: start, stop, generateToken, list")
 	}
@@ -301,18 +313,42 @@ func getWorkstation(c *gin.Context) (any, error) {
 		singleton.DB.Save(&bind)
 	}
 	// --- End oauth2 ---
+	type Result struct {
+		ID     uint64      `json:"id"`
+		Result interface{} `json:"result"`
+		Error  string      `json:"error,omitempty"`
+	}
 
-	// Gọi Google Cloud Workstations API
-	body, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action)
-	if err != nil {
-		return nil, singleton.Localizer.ErrorT("call workstation api failed: "+err.Error())
+	// Channel để giới hạn số goroutine đồng thời
+	maxWorkers := 20
+	sem := make(chan struct{}, maxWorkers)
+
+	results := make([]Result, len(servers))
+	var wg sync.WaitGroup
+
+	for i, id := range servers {
+		wg.Add(1)
+		sem <- struct{}{} // chặn nếu đã đủ 20 goroutine
+		go func(i int, id uint64) {
+			defer wg.Done()
+			defer func() { <-sem }() // giải phóng slot
+
+			serverIdStr := fmt.Sprintf("%d", id)
+			body, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action)
+			if err != nil {
+				results[i] = Result{ID: id, Error: err.Error()}
+				return
+			}
+			var result any
+			if err := json.Unmarshal(body, &result); err != nil {
+				results[i] = Result{ID: id, Error: err.Error()}
+				return
+			}
+			results[i] = Result{ID: id, Result: result}
+		}(i, id)
 	}
-	
-	var result any
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
+	wg.Wait()
+	return results, nil
 }
 
 func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) ([]byte, error) {

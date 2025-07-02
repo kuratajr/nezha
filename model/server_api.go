@@ -30,7 +30,7 @@ type ServerForm struct {
 	DDNSProfiles        []uint64            `json:"ddns_profiles,omitempty" validate:"optional"`  // DDNS配置
 	OverrideDDNSDomains map[uint64][]string `json:"override_ddns_domains,omitempty" validate:"optional"`
 	Zone                string              `json:"zone,omitempty"`
-	ProjectID           uint64              `json:"project_id,omitempty"` // 关联的项目ID
+	ProjectID           string              `json:"project_id,omitempty"` // 关联的项目ID
 	ClusterID           string              `json:"cluster_id,omitempty"` // 关联的集群ID
 	ConfigDetail        ConfigDetail        `json:"config_detail,omitempty"`
 }

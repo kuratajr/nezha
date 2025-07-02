@@ -24,7 +24,7 @@ type Server struct {
 	DDNSProfilesRaw        string `gorm:"default:'[]';column:ddns_profiles_raw" json:"-"`
 	OverrideDDNSDomainsRaw string `gorm:"default:'{}';column:override_ddns_domains_raw" json:"-"`
 	Zone                   string `json:"zone,omitempty"`
-	ProjectID              uint64 `json:"project_id,omitempty"` // 关联的项目ID
+	ProjectID              string `json:"project_id,omitempty"` // 关联的项目ID
 	ClusterID              string `json:"cluster_id,omitempty"` // 关联的集群ID
 	ConfigDetail           ConfigDetail `json:"config_detail,omitempty"` // 配置详情，存储配置文件内容
 

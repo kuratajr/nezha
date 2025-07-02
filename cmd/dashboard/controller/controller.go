@@ -110,14 +110,14 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 
 	auth.GET("/server", listHandler(listServer))
 	auth.PATCH("/server/:id", commonHandler(updateServer))
-	auth.PATCH("/server/detail/:id", commonHandler(updateServerDetail))
 	auth.GET("/server/config/:id", commonHandler(getServerConfig))
 	auth.POST("/server/config", commonHandler(setServerConfig))
 	auth.POST("/batch-delete/server", commonHandler(batchDeleteServer))
 	auth.POST("/batch-move/server", commonHandler(batchMoveServer))
 	auth.POST("/force-update/server", commonHandler(forceUpdateServer))
 
-	auth.GET("/server/:provider/:action/:id", commonHandler(getWorkstation))
+	auth.POST("/server/:provider/:action", commonHandler(getWorkstation))
+	auth.GET("/server/:provider/detail/:id", commonHandler(getWorkstationDetail))
 
 	auth.GET("/notification", listHandler(listNotification))
 	auth.POST("/notification", commonHandler(createNotification))
