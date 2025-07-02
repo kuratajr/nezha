@@ -1,13 +1,12 @@
 package controller
 
 import (
-"slices"
+	"slices"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,6 +403,189 @@ func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) (
 	}
 	
 	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Google Workstations API error (status %d): %s", resp.StatusCode, string(responseBody))
+	}
+	
+	return responseBody, nil
+}
+
+func getWorkstationDetail(c *gin.Context) (any, error) {
+	provider := strings.ToLower(c.Param("provider"))
+    if provider != "google" {
+        return nil, singleton.Localizer.ErrorT("only support google provider")
+    }
+	
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	var s model.Server
+	if err := singleton.DB.First(&s, id).Error; err != nil {
+		return nil, singleton.Localizer.ErrorT("server id %d does not exist", id)
+	}
+
+	if !s.HasPermission(c) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	//Lay zone, projectId, clusterId, workstationId tu server
+	zone := s.Zone
+	projectId := s.ProjectID
+	clusterId := s.ClusterID
+	workstationId := s.Name
+	
+
+	u := c.MustGet(model.CtxKeyAuthorizedUser).(*model.User)
+	var bind model.Oauth2Bind
+	err = singleton.DB.Where("provider = ? AND user_id = ?", provider, u.ID).First(&bind).Error
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("oauth2 not binded")
+	}
+	
+	// Lấy clientID, clientSecret từ config
+	conf, ok := singleton.Conf.Oauth2[provider]
+	if !ok {
+		return nil, singleton.Localizer.ErrorT("provider config not found")
+	}
+
+	// --- Sử dụng thư viện oauth2 để tự động refresh token ---
+	importCtx := context.Background()
+	token := &oauth2.Token{
+		AccessToken:  bind.AccessToken,
+		RefreshToken: bind.RefreshToken,
+		Expiry:       time.Unix(bind.TokenExpiry, 0),
+	}
+	oauthConf := &oauth2.Config{
+		ClientID:     conf.ClientID,
+		ClientSecret: conf.ClientSecret,
+		Endpoint:     google.Endpoint,
+	}
+	tokenSource := oauthConf.TokenSource(importCtx, token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("refresh token failed: "+err.Error())
+	}
+	// Nếu token mới khác token cũ, lưu lại vào DB
+	if newToken.AccessToken != bind.AccessToken {
+		bind.AccessToken = newToken.AccessToken
+		bind.TokenExpiry = newToken.Expiry.Unix()
+		singleton.DB.Save(&bind)
+	}
+	// --- End oauth2 ---
+
+	// Gọi Google Cloud Workstations API
+	body, err := callWorkstationDetailAPI(c, newToken.AccessToken, zone, projectId, clusterId, workstationId)
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("call workstation api failed: "+err.Error())
+	}
+	
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	// Lưu các field từ result vào ConfigDetail
+	if name, ok := result["name"].(string); ok {
+		s.ConfigDetail.Name = name
+	}
+	if displayName, ok := result["displayName"].(string); ok {
+		s.ConfigDetail.DisplayName = displayName
+	}
+	if uid, ok := result["uid"].(string); ok {
+		s.ConfigDetail.Uid = uid
+	}
+	if createTime, ok := result["createTime"].(string); ok {
+		s.ConfigDetail.CreateTime = createTime
+	}
+	if updateTime, ok := result["updateTime"].(string); ok {
+		s.ConfigDetail.UpdateTime = updateTime
+	}
+	if etag, ok := result["etag"].(string); ok {
+		s.ConfigDetail.Etag = etag
+	}
+	if state, ok := result["state"].(string); ok {
+		s.ConfigDetail.State = state
+	}
+	if host, ok := result["host"].(string); ok {
+		s.ConfigDetail.Host = host
+	}
+	if startTime, ok := result["startTime"].(string); ok {
+		s.ConfigDetail.StartTime = startTime
+	}
+	if satisfiesPzi, ok := result["satisfiesPzi"].(bool); ok {
+		s.ConfigDetail.SatisfiesPzi = satisfiesPzi
+	}
+	
+	// Cập nhật map fields nếu có
+	if annotations, ok := result["annotations"].(map[string]interface{}); ok {
+		// Convert map[string]interface{} to map[string]string
+		annotationsStr := make(map[string]string)
+		for k, v := range annotations {
+			if str, ok := v.(string); ok {
+				annotationsStr[k] = str
+			}
+		}
+		s.ConfigDetail.Annotations = annotationsStr
+	}
+	if env, ok := result["env"].(map[string]interface{}); ok {
+		// Convert map[string]interface{} to map[string]string
+		envStr := make(map[string]string)
+		for k, v := range env {
+			if str, ok := v.(string); ok {
+				envStr[k] = str
+			}
+		}
+		s.ConfigDetail.Env = envStr
+	}
+	if runtimeHost, ok := result["runtimeHost"].(map[string]interface{}); ok {
+		s.ConfigDetail.RuntimeHost = runtimeHost
+	}
+	
+	// Lưu vào database
+	if err := singleton.DB.Save(&s).Error; err != nil {
+		return nil, newGormError("%v", err)
+	}
+
+	// Cập nhật cache
+	rs, _ := singleton.ServerShared.Get(s.ID)
+	s.CopyFromRunningServer(rs)
+	singleton.ServerShared.Update(&s, "")
+
+	fmt.Println("result", result)
+	return result, nil
+}
+
+func callWorkstationDetailAPI(c *gin.Context,accessToken,zone,projectId,clusterId,workstationId string) ([]byte, error) {
+	var method string
+	var body io.Reader
+	
+	apiURL := fmt.Sprintf("https://workstations.googleapis.com/v1beta/projects/%s/locations/%s/workstationClusters/%s/workstationConfigs/monospace-config-android-studio/workstations/%s", projectId, zone, clusterId, workstationId)
+	method = "GET"
+	body = nil
+	
+	req, err := http.NewRequest(method, apiURL, body)
 	if err != nil {
 		return nil, err
 	}
