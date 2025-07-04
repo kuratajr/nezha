@@ -61,6 +61,7 @@ func createCron(c *gin.Context) (uint64, error) {
 	cr.Command = cf.Command
 	cr.Servers = cf.Servers
 	cr.PushSuccessful = cf.PushSuccessful
+	cr.Live = cf.Live
 	cr.NotificationGroupID = cf.NotificationGroupID
 	cr.Cover = cf.Cover
 
@@ -127,6 +128,7 @@ func updateCron(c *gin.Context) (any, error) {
 	cr.Command = cf.Command
 	cr.Servers = cf.Servers
 	cr.PushSuccessful = cf.PushSuccessful
+	cr.Live = cf.Live
 	cr.NotificationGroupID = cf.NotificationGroupID
 	cr.Cover = cf.Cover
 
