@@ -158,6 +158,7 @@ func updateServerDetail(c *gin.Context) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	
 	var sf model.ServerForm
 	if err := c.ShouldBindJSON(&sf); err != nil {
 		return nil, err

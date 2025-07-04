@@ -203,6 +203,7 @@ type ConfigDetail struct {
     SatisfiesPzi bool              `json:"satisfiesPzi,omitempty"`
     RuntimeHost  map[string]interface{} `json:"runtimeHost,omitempty"`
 	Token		 string            `json:"token,omitempty"` // 仅用于API调用，存储在数据库中
+	TokenExpiry  int64             `json:"tokenExpiry,omitempty"`
 }
 
 // Value implements the driver.Valuer interface
