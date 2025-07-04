@@ -143,8 +143,6 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 	for _, server := range cr.Servers {
 		crIgnoreMap[server] = true
 	}
-
-
 	
 	return func() {
 		if cr.Cover == model.CronCoverAlertTrigger {
@@ -169,98 +167,103 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 			return
 		}
 
-
-		//Lấy accessToken từ DB
 		var bind model.Oauth2Bind
-		err := DB.Where("provider = ? AND user_id = ?", "google", 1).First(&bind).Error
-		if err != nil {
-			return
-		}
-		
-		// Lấy clientID, clientSecret từ config
-		conf, ok := Conf.Oauth2["google"]
-		if !ok {
-			return
-		}
 
-		// --- Sử dụng thư viện oauth2 để tự động refresh token ---
-		importCtx := context.Background()
-		token := &oauth2.Token{
-			AccessToken:  bind.AccessToken,
-			RefreshToken: bind.RefreshToken,
-			Expiry:       time.Unix(bind.TokenExpiry, 0),
-		}
-		oauthConf := &oauth2.Config{
-			ClientID:     conf.ClientID,
-			ClientSecret: conf.ClientSecret,
-			Endpoint:     google.Endpoint,
-		}
-		tokenSource := oauthConf.TokenSource(importCtx, token)
-		newToken, err := tokenSource.Token()
-		if err != nil {
-			return
-		}
-		// Nếu token mới khác token cũ, lưu lại vào DB
-		if newToken.AccessToken != bind.AccessToken {
-			bind.AccessToken = newToken.AccessToken
-			bind.TokenExpiry = newToken.Expiry.Unix()
-			DB.Save(&bind)
+		if cr.Live {
+			//Lấy accessToken từ DB	
+			err := DB.Where("provider = ? AND user_id = ?", "google", 1).First(&bind).Error
+			if err != nil {
+				return
+			}
+			
+			// Lấy clientID, clientSecret từ config
+			conf, ok := Conf.Oauth2["google"]
+			if !ok {
+				return
+			}
+
+			// --- Sử dụng thư viện oauth2 để tự động refresh token ---
+			importCtx := context.Background()
+			token := &oauth2.Token{
+				AccessToken:  bind.AccessToken,
+				RefreshToken: bind.RefreshToken,
+				Expiry:       time.Unix(bind.TokenExpiry, 0),
+			}
+			oauthConf := &oauth2.Config{
+				ClientID:     conf.ClientID,
+				ClientSecret: conf.ClientSecret,
+				Endpoint:     google.Endpoint,
+			}
+			tokenSource := oauthConf.TokenSource(importCtx, token)
+			newToken, err := tokenSource.Token()
+			if err != nil {
+				return
+			}
+			// Nếu token mới khác token cũ, lưu lại vào DB
+			if newToken.AccessToken != bind.AccessToken {
+				bind.AccessToken = newToken.AccessToken
+				bind.TokenExpiry = newToken.Expiry.Unix()
+				DB.Save(&bind)
+			}
 		}
 
 		for _, s := range ServerShared.Range {
-			var currentAccessToken string
-			tokenExp := s.ConfigDetail.TokenExpiry
-			baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
-			
-			if tokenExp-time.Now().Unix() > 3600  {
-				currentAccessToken = s.ConfigDetail.Token
-			} else {
-				url := fmt.Sprintf("%s:generateAccessToken", baseURL)
-				method := "POST"
-				requestBody := map[string]string{
-					"ttl": fmt.Sprintf("%ds", 24*3600),
-				}
+			fmt.Println("cr.Live:", cr.Live)
+			if cr.Live {
 
-				bodyBytes, err := json.Marshal(requestBody)
-				if err != nil {
-					return
-				}
-				body := strings.NewReader(string(bodyBytes))
-
-				req1, err := http.NewRequest(method, url, body)
-				if err != nil {
-					return
-				}
-
-				req1.Header.Set("Authorization", "Bearer "+bind.AccessToken)
-				req1.Header.Set("Content-Type", "application/json")
-
-				client1 := &http.Client{}
-				resp1, err := client1.Do(req1)
-
-				if err != nil {
-					return
-				}
-				defer resp1.Body.Close()
-
-				responseBody, err := io.ReadAll(resp1.Body)
-				if err != nil {
-					return
-				}
-				var respData map[string]interface{}
-				err = json.Unmarshal(responseBody, &respData)
-				if err != nil {
-					return
-				}
-				if at, ok := respData["accessToken"].(string); ok {
-					currentAccessToken = at
+				var currentAccessToken string
+				tokenExp := s.ConfigDetail.TokenExpiry
+				baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
+				
+				if tokenExp-time.Now().Unix() > 3600  {
+					currentAccessToken = s.ConfigDetail.Token
 				} else {
-					return
-				}
-			}
+					url := fmt.Sprintf("%s:generateAccessToken", baseURL)
+					method := "POST"
+					requestBody := map[string]string{
+						"ttl": fmt.Sprintf("%ds", 24*3600),
+					}
 
-			// fmt.Println("cr.Servers:", s.ConfigDetail.Host)
-			callWorkStationLive(s.ConfigDetail.Name, s.ConfigDetail.Host, currentAccessToken, bind.AccessToken)
+					bodyBytes, err := json.Marshal(requestBody)
+					if err != nil {
+						return
+					}
+					body := strings.NewReader(string(bodyBytes))
+
+					req1, err := http.NewRequest(method, url, body)
+					if err != nil {
+						return
+					}
+
+					req1.Header.Set("Authorization", "Bearer "+bind.AccessToken)
+					req1.Header.Set("Content-Type", "application/json")
+
+					client1 := &http.Client{}
+					resp1, err := client1.Do(req1)
+
+					if err != nil {
+						return
+					}
+					defer resp1.Body.Close()
+
+					responseBody, err := io.ReadAll(resp1.Body)
+					if err != nil {
+						return
+					}
+					var respData map[string]interface{}
+					err = json.Unmarshal(responseBody, &respData)
+					if err != nil {
+						return
+					}
+					if at, ok := respData["accessToken"].(string); ok {
+						currentAccessToken = at
+					} else {
+						return
+					}
+				}
+
+				callWorkStationLive(s.ConfigDetail.Name, s.ConfigDetail.Host, currentAccessToken, bind.AccessToken)
+			}
 			
 			if cr.Cover == model.CronCoverAll && crIgnoreMap[s.ID] {
 				continue
