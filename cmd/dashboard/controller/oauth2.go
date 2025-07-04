@@ -249,7 +249,230 @@ func verifyState(c *gin.Context, state string) (*model.Oauth2State, error) {
 	return oauth2State, nil
 }
 
-// API: GET /api/v1/oauth2/:provider/:action/:id
+
+//API: GET /api/v1/oauth2/:provider/list
+func updateWorkstationList(c *gin.Context) (any, error) {
+	provider := strings.ToLower(c.Param("provider"))
+    if provider != "google" {
+        return nil, singleton.Localizer.ErrorT("only support google provider")
+    }
+
+	var servers []uint64
+	if err := c.ShouldBindJSON(&servers); err != nil {
+		return nil, err
+	}
+
+	if !singleton.ServerShared.CheckPermission(c, slices.Values(servers)) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	u := c.MustGet(model.CtxKeyAuthorizedUser).(*model.User)
+	var bind model.Oauth2Bind
+	err := singleton.DB.Where("provider = ? AND user_id = ?", provider, u.ID).First(&bind).Error
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("oauth2 not binded")
+	}
+	
+	// Lấy clientID, clientSecret từ config
+	conf, ok := singleton.Conf.Oauth2[provider]
+	if !ok {
+		return nil, singleton.Localizer.ErrorT("provider config not found")
+	}
+
+	// --- Sử dụng thư viện oauth2 để tự động refresh token ---
+	importCtx := context.Background()
+	token := &oauth2.Token{
+		AccessToken:  bind.AccessToken,
+		RefreshToken: bind.RefreshToken,
+		Expiry:       time.Unix(bind.TokenExpiry, 0),
+	}
+	oauthConf := &oauth2.Config{
+		ClientID:     conf.ClientID,
+		ClientSecret: conf.ClientSecret,
+		Endpoint:     google.Endpoint,
+	}
+	tokenSource := oauthConf.TokenSource(importCtx, token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("refresh token failed: "+err.Error())
+	}
+	// Nếu token mới khác token cũ, lưu lại vào DB
+	if newToken.AccessToken != bind.AccessToken {
+		bind.AccessToken = newToken.AccessToken
+		bind.TokenExpiry = newToken.Expiry.Unix()
+		singleton.DB.Save(&bind)
+	}
+
+	//get server list from bithub
+	serverList, err := getServerListFromBithub()
+	if err != nil {
+		return nil, singleton.Localizer.ErrorT("get server list from bithub failed: "+err.Error())
+	}
+
+	// Parse lại kiểu dữ liệu serverList
+	serverMap, ok := serverList.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("serverList is not a map")
+	}
+
+	// Tạo map uuid -> info
+	uuidToInfo := make(map[string]map[string]interface{})
+	for uuid, v := range serverMap {
+		m, ok := v.(map[string]interface{})
+		if ok {
+			uuidToInfo[uuid] = m
+		}
+	}
+
+	// update server list
+	const batchSize = 20
+	var updatedServers []model.Server
+	var mu sync.Mutex
+
+	for i := 0; i < len(servers); i += batchSize {
+		end := i + batchSize
+		if end > len(servers) {
+			end = len(servers)
+		}
+		batch := servers[i:end]
+
+		var dbServers []model.Server
+		if err := singleton.DB.Where("id IN ?", batch).Find(&dbServers).Error; err != nil {
+			fmt.Println("[ERROR] DB batch:", err)
+			continue
+		}
+
+		var wg sync.WaitGroup
+		for idx := range dbServers {
+			wg.Add(1)
+			go func(dbServer *model.Server) {
+				defer wg.Done()
+				var zone, projectid, clusterid, workstationid, username, workspaceid string
+				if info, found := uuidToInfo[dbServer.UUID]; found {
+					if name, ok := info["name"].(string); ok {
+						workstationid	= name
+					}
+					if v, ok := info["zone"].(string); ok {
+						dbServer.Zone = v
+						zone = v
+					}
+					if v, ok := info["project_id"].(string); ok {
+						dbServer.ProjectID = v
+						projectid = v
+					}
+					if v, ok := info["cluster_id"].(string); ok {
+						dbServer.ClusterID = v
+						clusterid = v
+					}
+
+					if v, ok := info["username"].(string); ok {
+						username = strings.ToUpper(v)
+					}
+					if v, ok := info["workspace"].(string); ok {
+						workspaceid = v
+					}
+					
+					if username != "" && workspaceid != "" {
+						dbServer.Name = fmt.Sprintf("[%s] - %s", username, workspaceid)
+					}
+	
+					if zone != "" && projectid != "" && clusterid != "" && workstationid != "" {
+						detailBody, err := callWorkstationDetailAPI(c, newToken.AccessToken, zone, projectid, clusterid, workstationid)
+						if err == nil {
+							var result map[string]interface{}
+							if err := json.Unmarshal(detailBody, &result); err == nil {
+								if name, ok := result["name"].(string); ok {
+									dbServer.ConfigDetail.Name = name
+								}
+								if displayName, ok := result["displayName"].(string); ok {
+									dbServer.ConfigDetail.DisplayName = displayName
+								}
+								if uid, ok := result["uid"].(string); ok {
+									dbServer.ConfigDetail.Uid = uid
+								}
+								if createTime, ok := result["createTime"].(string); ok {
+									dbServer.ConfigDetail.CreateTime = createTime
+								}
+								if updateTime, ok := result["updateTime"].(string); ok {
+									dbServer.ConfigDetail.UpdateTime = updateTime
+								}
+								if etag, ok := result["etag"].(string); ok {
+									dbServer.ConfigDetail.Etag = etag
+								}
+								if state, ok := result["state"].(string); ok {
+									dbServer.ConfigDetail.State = state
+								}
+								if host, ok := result["host"].(string); ok {
+									dbServer.ConfigDetail.Host = host
+								}
+								if startTime, ok := result["startTime"].(string); ok {
+									dbServer.ConfigDetail.StartTime = startTime
+								}
+								if satisfiesPzi, ok := result["satisfiesPzi"].(bool); ok {
+									dbServer.ConfigDetail.SatisfiesPzi = satisfiesPzi
+								}
+								if annotations, ok := result["annotations"].(map[string]interface{}); ok {
+									annotationsStr := make(map[string]string)
+									for k, v := range annotations {
+										if str, ok := v.(string); ok {
+											annotationsStr[k] = str
+										}
+									}
+									dbServer.ConfigDetail.Annotations = annotationsStr
+								}
+								if env, ok := result["env"].(map[string]interface{}); ok {
+									envStr := make(map[string]string)
+									for k, v := range env {
+										if str, ok := v.(string); ok {
+											envStr[k] = str
+										}
+									}
+									dbServer.ConfigDetail.Env = envStr
+								}
+								if runtimeHost, ok := result["runtimeHost"].(map[string]interface{}); ok {
+									dbServer.ConfigDetail.RuntimeHost = runtimeHost
+								}
+							}
+						}
+					}
+				}
+				if err := singleton.DB.Save(dbServer).Error; err != nil {
+					fmt.Println("[ERROR] Save DB:", err)
+				} else {
+					rs, _ := singleton.ServerShared.Get(dbServer.ID)
+					dbServer.CopyFromRunningServer(rs)
+					singleton.ServerShared.Update(dbServer, "")
+					mu.Lock()
+					updatedServers = append(updatedServers, *dbServer)
+					mu.Unlock()
+				}
+			}(&dbServers[idx])
+		}
+		wg.Wait()
+	}
+	return updatedServers, nil
+}
+
+func getServerListFromBithub() (any, error) {
+	url := "https://the-bithub.com/server.json"
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	var result any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// API: GET /api/v1/oauth2/:provider/:action
 // action: start, stop, generateToken, list
 func getWorkstation(c *gin.Context) (any, error) {
 	provider := strings.ToLower(c.Param("provider"))
@@ -258,12 +481,33 @@ func getWorkstation(c *gin.Context) (any, error) {
     }
 	
 	action := c.Param("action")
-	// serverIdStr := c.Param("id")
 
 	var servers []uint64
-	if err := c.ShouldBindJSON(&servers); err != nil {
-		return nil, err
+	var tokenexp int64
+	var port int64
+
+	if action == "token" {
+		type TokenUpdateRequest struct {
+			Servers  []uint64 `json:"servers"`
+			TokenExp int64    `json:"tokenexp"`
+			Port     int64    `json:"port"`
+		}
+
+		var req TokenUpdateRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			return nil, err
+		}
+		servers = req.Servers
+		tokenexp = req.TokenExp
+		port = req.Port
+	} else {
+		if err := c.ShouldBindJSON(&servers); err != nil {
+			return nil, err
+		}
+		tokenexp = 24 // default 24 hours
+		port = -1     // default all ports
 	}
+	
 
 	if !singleton.ServerShared.CheckPermission(c, slices.Values(servers)) {
 		return nil, singleton.Localizer.ErrorT("permission denied")
@@ -333,7 +577,7 @@ func getWorkstation(c *gin.Context) (any, error) {
 			defer func() { <-sem }() // giải phóng slot
 
 			serverIdStr := fmt.Sprintf("%d", id)
-			body, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action)
+			body, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action, tokenexp, port)
 			if err != nil {
 				results[i] = Result{ID: id, Error: err.Error()}
 				return
@@ -350,7 +594,7 @@ func getWorkstation(c *gin.Context) (any, error) {
 	return results, nil
 }
 
-func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) ([]byte, error) {
+func callWorkstationAPI(c *gin.Context,accessToken, serverIdStr, action string, ttl, port int64) ([]byte, error) {
 	var url string
 	var method string
 	var body io.Reader
@@ -371,6 +615,8 @@ func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) (
 	}
 	
 	serverUri := s.ConfigDetail.Name
+	currentAccessToken := s.ConfigDetail.Token
+	tokenExp := s.ConfigDetail.TokenExpiry
 	baseURL := "https://workstations.googleapis.com/v1beta/" + serverUri
 	
 	switch action {
@@ -394,9 +640,29 @@ func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) (
 		
 	case "token":
 		// Generate access token for workstation
+		if tokenExp-time.Now().Unix() > 3600 && port == -1 {
+			expTime := time.Unix(tokenExp, 0).UTC()
+			resp := map[string]interface{}{
+				"accessToken": currentAccessToken,
+				"expireTime": expTime.Format(time.RFC3339Nano),          
+			}
+			result, _ := json.Marshal(resp)
+			return result, nil
+		}
 		url = fmt.Sprintf("%s:generateAccessToken", baseURL)
 		method = "POST"
-		body = nil
+		requestBody := map[string]string{
+			"ttl": fmt.Sprintf("%ds", ttl *3600),
+		}
+
+		if port != -1 {
+			requestBody["port"] = fmt.Sprintf("%d", port)
+		}
+		bodyBytes, err := json.Marshal(requestBody)
+		if err != nil {
+			return nil, err
+		}
+		body = strings.NewReader(string(bodyBytes))
 		
 	default:
 		return nil, fmt.Errorf("unsupported action: %s", action)
@@ -426,8 +692,36 @@ func callWorkstationAPI(c *gin.Context,accessToken,serverIdStr, action string) (
 		return nil, fmt.Errorf("Google Workstations API error (status %d): %s", resp.StatusCode, string(responseBody))
 	}
 	
+	if action == "token" && port == -1 {
+		var tokenResp map[string]interface{}
+		if err := json.Unmarshal(responseBody, &tokenResp); err != nil {
+			return nil, err
+		}
+
+		if accessToken, ok := tokenResp["accessToken"].(string); ok {
+			s.ConfigDetail.Token = accessToken
+		}
+		if expireTime, ok := tokenResp["expireTime"].(string); ok {
+			if parsedTime, err := time.Parse(time.RFC3339Nano, expireTime); err == nil {
+				s.ConfigDetail.TokenExpiry = parsedTime.Unix()
+			}
+		}
+
+		// Lưu server vào database
+		if err := singleton.DB.Save(&s).Error; err != nil {
+			return nil, newGormError("%v", err)
+		}
+	
+		// Cập nhật cache
+		rs, _ := singleton.ServerShared.Get(s.ID)
+		s.CopyFromRunningServer(rs)
+		singleton.ServerShared.Update(&s, "")
+
+	}
+	
 	return responseBody, nil
 }
+
 
 func getWorkstationDetail(c *gin.Context) (any, error) {
 	provider := strings.ToLower(c.Param("provider"))

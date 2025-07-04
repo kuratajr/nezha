@@ -118,6 +118,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 
 	auth.POST("/server/:provider/:action", commonHandler(getWorkstation))
 	auth.GET("/server/:provider/detail/:id", commonHandler(getWorkstationDetail))
+	auth.POST("/server/:provider/list", commonHandler(updateWorkstationList))
 
 	auth.GET("/notification", listHandler(listNotification))
 	auth.POST("/notification", commonHandler(createNotification))
