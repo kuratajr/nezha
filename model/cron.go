@@ -28,7 +28,8 @@ type Cron struct {
 	LastExecutedAt      time.Time `json:"last_executed_at,omitempty"` // 最后一次执行时间
 	LastResult          bool      `json:"last_result,omitempty"`      // 最后一次执行结果
 	Cover               uint8     `json:"cover"`                      // 计划任务覆盖范围 (0:仅覆盖特定服务器 1:仅忽略特定服务器 2:由触发该计划任务的服务器执行)
-
+	Live                bool      `json:"live,omitempty"`             // 是否启用
+	
 	CronJobID  cron.EntryID `gorm:"-" json:"cron_job_id,omitempty"`
 	ServersRaw string       `json:"-"`
 }
