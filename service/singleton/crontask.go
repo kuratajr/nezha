@@ -20,7 +20,7 @@ import (
     "golang.org/x/oauth2"
     "golang.org/x/oauth2/google"
 	"encoding/json"
-	
+	"sync"
 )
 
 type CronClass struct {
@@ -138,6 +138,11 @@ func ManualTrigger(cr *model.Cron) {
 	CronTrigger(cr)()
 }
 
+const (
+	// Batch size for concurrent processing
+	BATCH_SIZE = 20
+)
+
 func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 	crIgnoreMap := make(map[uint64]bool)
 	for _, server := range cr.Servers {
@@ -207,83 +212,109 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 			}
 		}
 
-		for _, s := range ServerShared.Range {
-			fmt.Println("cr.Live:", cr.Live)
-			if cr.Live {
+		// Process servers in batches
+		processServersInBatches(cr, crIgnoreMap, bind)
+	}
+}
 
-				var currentAccessToken string
-				tokenExp := s.ConfigDetail.TokenExpiry
-				baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
-				
-				if tokenExp-time.Now().Unix() > 3600  {
-					currentAccessToken = s.ConfigDetail.Token
-				} else {
-					url := fmt.Sprintf("%s:generateAccessToken", baseURL)
-					method := "POST"
-					requestBody := map[string]string{
-						"ttl": fmt.Sprintf("%ds", 24*3600),
-					}
+// processServersInBatches processes servers in batches with concurrent execution
+func processServersInBatches(cr *model.Cron, crIgnoreMap map[uint64]bool, bind model.Oauth2Bind) {
+	// Collect all servers into a slice
+	var servers []*model.Server
+	ServerShared.Range(func(k uint64, v *model.Server) bool {
+		servers = append(servers, v)
+		return true
+	})
+	totalServers := len(servers)
+	// Calculate number of batches
+	numBatches := (totalServers + BATCH_SIZE - 1) / BATCH_SIZE
+	// Process each batch sequentially
+	for i := 0; i < numBatches; i++ {
+		start := i * BATCH_SIZE
+		end := start + BATCH_SIZE
+		if end > totalServers {
+			end = totalServers
+		}
+		batch := servers[start:end]
+		fmt.Println("batch:", batch)
+		var wg sync.WaitGroup
+		for _, s := range batch {
+			wg.Add(1)
+			go func(server *model.Server) {
+				defer wg.Done()
+				processServerBatch(cr, server, crIgnoreMap, bind)
+			}(s)
+		}
+		wg.Wait() // Wait for all servers in this batch to finish
+	}
+}
 
-					bodyBytes, err := json.Marshal(requestBody)
-					if err != nil {
-						return
-					}
-					body := strings.NewReader(string(bodyBytes))
-
-					req1, err := http.NewRequest(method, url, body)
-					if err != nil {
-						return
-					}
-
-					req1.Header.Set("Authorization", "Bearer "+bind.AccessToken)
-					req1.Header.Set("Content-Type", "application/json")
-
-					client1 := &http.Client{}
-					resp1, err := client1.Do(req1)
-
-					if err != nil {
-						return
-					}
-					defer resp1.Body.Close()
-
-					responseBody, err := io.ReadAll(resp1.Body)
-					if err != nil {
-						return
-					}
-					var respData map[string]interface{}
-					err = json.Unmarshal(responseBody, &respData)
-					if err != nil {
-						return
-					}
-					if at, ok := respData["accessToken"].(string); ok {
-						currentAccessToken = at
-					} else {
-						return
-					}
-				}
-
-				callWorkStationLive(s.ConfigDetail.Name, s.ConfigDetail.Host, currentAccessToken, bind.AccessToken)
+// processServerBatch processes a single server (not a batch anymore)
+func processServerBatch(cr *model.Cron, s *model.Server, crIgnoreMap map[uint64]bool, bind model.Oauth2Bind) {
+	fmt.Println("[", time.Now().Format(time.RFC3339), "] Live:", cr.Live)
+	if cr.Live {
+		var currentAccessToken string
+		tokenExp := s.ConfigDetail.TokenExpiry
+		baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
+		if tokenExp-time.Now().Unix() > 3600  {
+			currentAccessToken = s.ConfigDetail.Token
+		} else {
+			url := fmt.Sprintf("%s:generateAccessToken", baseURL)
+			method := "POST"
+			requestBody := map[string]string{
+				"ttl": fmt.Sprintf("%ds", 24*3600),
 			}
-			
-			if cr.Cover == model.CronCoverAll && crIgnoreMap[s.ID] {
-				continue
+			bodyBytes, err := json.Marshal(requestBody)
+			if err != nil {
+				return
 			}
-			if cr.Cover == model.CronCoverIgnoreAll && !crIgnoreMap[s.ID] {
-				continue
+			body := strings.NewReader(string(bodyBytes))
+			req1, err := http.NewRequest(method, url, body)
+			if err != nil {
+				return
 			}
-			if s.TaskStream != nil {
-				s.TaskStream.Send(&pb.Task{
-					Id:   cr.ID,
-					Data: cr.Command,
-					Type: model.TaskTypeCommand,
-				})
+			req1.Header.Set("Authorization", "Bearer "+bind.AccessToken)
+			req1.Header.Set("Content-Type", "application/json")
+			client1 := &http.Client{}
+			resp1, err := client1.Do(req1)
+			if err != nil {
+				return
+			}
+			defer resp1.Body.Close()
+			responseBody, err := io.ReadAll(resp1.Body)
+			if err != nil {
+				return
+			}
+			var respData map[string]interface{}
+			err = json.Unmarshal(responseBody, &respData)
+			if err != nil {
+				return
+			}
+			if at, ok := respData["accessToken"].(string); ok {
+				currentAccessToken = at
 			} else {
-				// 保存当前服务器状态信息
-				curServer := model.Server{}
-				copier.Copy(&curServer, s)
-				go NotificationShared.SendNotification(cr.NotificationGroupID, Localizer.Tf("[Task failed] %s: server %s is offline and cannot execute the task", cr.Name, s.Name), "", &curServer)
+				return
 			}
 		}
+		callWorkStationLive(s.ConfigDetail.Name, s.ConfigDetail.Host, currentAccessToken, bind.AccessToken)
+	}
+	if cr.Cover == model.CronCoverAll && crIgnoreMap[s.ID] {
+		return
+	}
+	if cr.Cover == model.CronCoverIgnoreAll && !crIgnoreMap[s.ID] {
+		return
+	}
+	if s.TaskStream != nil {
+		s.TaskStream.Send(&pb.Task{
+			Id:   cr.ID,
+			Data: cr.Command,
+			Type: model.TaskTypeCommand,
+		})
+	} else {
+		// 保存当前服务器状态信息
+		curServer := model.Server{}
+		copier.Copy(&curServer, s)
+		go NotificationShared.SendNotification(cr.NotificationGroupID, Localizer.Tf("[Task failed] %s: server %s is offline and cannot execute the task", cr.Name, s.Name), "", &curServer)
 	}
 }
 
