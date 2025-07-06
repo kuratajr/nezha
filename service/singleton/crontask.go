@@ -174,7 +174,7 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 
 		var bind model.Oauth2Bind
 
-		if cr.Live {
+		if cr.Action == "live" || cr.Action == "start" || cr.Action == "stop" {
 			//Lấy accessToken từ DB	
 			err := DB.Where("provider = ? AND user_id = ?", "google", 1).First(&bind).Error
 			if err != nil {
@@ -306,7 +306,7 @@ func processServerBatch(cr *model.Cron, s *model.Server, crIgnoreMap map[uint64]
 					return
 				}
 				s.ConfigDetail.TokenExpiry = expTime.Unix()
-				
+
 			} else {
 				return
 			}
