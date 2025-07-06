@@ -64,6 +64,7 @@ func createCron(c *gin.Context) (uint64, error) {
 	cr.Action = cf.Action
 	cr.NotificationGroupID = cf.NotificationGroupID
 	cr.Cover = cf.Cover
+	cr.UID = cf.UID
 
 	if cr.TaskType == model.CronTypeCronTask && cr.Cover == model.CronCoverAlertTrigger {
 		return 0, singleton.Localizer.ErrorT("scheduled tasks cannot be triggered by alarms")
@@ -131,6 +132,7 @@ func updateCron(c *gin.Context) (any, error) {
 	cr.Action = cf.Action
 	cr.NotificationGroupID = cf.NotificationGroupID
 	cr.Cover = cf.Cover
+	cr.UID = cf.UID
 
 	if cr.TaskType == model.CronTypeCronTask && cr.Cover == model.CronCoverAlertTrigger {
 		return nil, singleton.Localizer.ErrorT("scheduled tasks cannot be triggered by alarms")

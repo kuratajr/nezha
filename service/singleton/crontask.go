@@ -176,7 +176,7 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 
 		if cr.Action == "live" || cr.Action == "start" || cr.Action == "stop" {
 			//Lấy accessToken từ DB	
-			err := DB.Where("provider = ? AND user_id = ?", "google", 1).First(&bind).Error
+			err := DB.Where("provider = ? AND user_id = ?", "google", cr.UID).First(&bind).Error
 			if err != nil {
 				return
 			}
