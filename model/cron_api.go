@@ -9,5 +9,5 @@ type CronForm struct {
 	Cover               uint8    `json:"cover,omitempty" default:"0"`
 	PushSuccessful      bool     `json:"push_successful,omitempty" validate:"optional"`
 	NotificationGroupID uint64   `json:"notification_group_id,omitempty"`
-	Live                bool      `json:"live,omitempty"`             // 是否启用
+	Action              string   `json:"action,omitempty"`             // 是否启用
 }

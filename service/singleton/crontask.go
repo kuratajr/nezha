@@ -251,16 +251,20 @@ func processServersInBatches(cr *model.Cron, crIgnoreMap map[uint64]bool, bind m
 
 // processServerBatch processes a single server (not a batch anymore)
 func processServerBatch(cr *model.Cron, s *model.Server, crIgnoreMap map[uint64]bool, bind model.Oauth2Bind) {
-	fmt.Println("[", time.Now().Format(time.RFC3339), "] Live:", cr.Live)
-	if cr.Live {
+	fmt.Println("[", time.Now().Format(time.RFC3339), "] Action:", cr.Action)
+
+	baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
+	var url, method string
+	var body io.Reader
+
+	if cr.Action == "live" {
 		var currentAccessToken string
 		tokenExp := s.ConfigDetail.TokenExpiry
-		baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
 		if tokenExp-time.Now().Unix() > 3600  {
 			currentAccessToken = s.ConfigDetail.Token
 		} else {
-			url := fmt.Sprintf("%s:generateAccessToken", baseURL)
-			method := "POST"
+			url = fmt.Sprintf("%s:generateAccessToken", baseURL)
+			method = "POST"
 			requestBody := map[string]string{
 				"ttl": fmt.Sprintf("%ds", 24*3600),
 			}
@@ -268,7 +272,7 @@ func processServerBatch(cr *model.Cron, s *model.Server, crIgnoreMap map[uint64]
 			if err != nil {
 				return
 			}
-			body := strings.NewReader(string(bodyBytes))
+			body = strings.NewReader(string(bodyBytes))
 			req1, err := http.NewRequest(method, url, body)
 			if err != nil {
 				return
@@ -292,12 +296,76 @@ func processServerBatch(cr *model.Cron, s *model.Server, crIgnoreMap map[uint64]
 			}
 			if at, ok := respData["accessToken"].(string); ok {
 				currentAccessToken = at
+				s.ConfigDetail.Token = at		
 			} else {
 				return
 			}
+			if exp, ok := respData["expireTime"].(string); ok {
+				expTime, err := time.Parse(time.RFC3339Nano, exp)
+				if err != nil {
+					return
+				}
+				s.ConfigDetail.TokenExpiry = expTime.Unix()
+				
+			} else {
+				return
+			}
+			// Cập nhật lại thông tin token và thời gian hết hạn vào DB
+			if err := DB.Save(&s).Error; err != nil {
+				return
+			}
+
+			// Cập nhật cache
+			rs, _ := ServerShared.Get(s.ID)
+			s.CopyFromRunningServer(rs)
+			ServerShared.Update(s, "")
 		}
 		callWorkStationLive(s.ConfigDetail.Name, s.ConfigDetail.Host, currentAccessToken, bind.AccessToken)
 	}
+	// If the action is "start", we will start the workstation
+	if cr.Action == "start" {
+		url = fmt.Sprintf("%s:start", baseURL)
+		method = "POST"
+		body = nil
+
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			return
+		}
+
+		req.Header.Set("Authorization", "Bearer "+ bind.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+	}
+	// If the action is "stop", we send a stop request
+	if cr.Action == "stop" {
+		url = fmt.Sprintf("%s:stop", baseURL)
+		method = "POST"
+		body = nil
+
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			return
+		}
+
+		req.Header.Set("Authorization", "Bearer "+ bind.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+	}
+
 	if cr.Cover == model.CronCoverAll && crIgnoreMap[s.ID] {
 		return
 	}
@@ -347,9 +415,9 @@ func callWorkStationLive(name, hostname, token, accessToken string) {
 
 	// responseBody, err := io.ReadAll(resp.Body)
 	
-	if err != nil {
-		return
-	}
+	// if err != nil {
+	// 	return
+	// }
 
 	if resp.StatusCode < 200 {
 		return
