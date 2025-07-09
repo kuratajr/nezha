@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
 
 	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-gonic/gin"
@@ -249,7 +250,311 @@ func verifyState(c *gin.Context, state string) (*model.Oauth2State, error) {
 	return oauth2State, nil
 }
 
+//API: POST /api/v1/server/:action/port
+func openPortCloudflared(c *gin.Context) (any, error) {
+	cloudflare_token := singleton.Conf.Cloudflared.Token
+	accountid := singleton.Conf.Cloudflared.AccountID
+	tunnelid := singleton.Conf.Cloudflared.TunnelID
+	tailscale_token := singleton.Conf.Tailscaled.Token
+	dns := singleton.Conf.Tailscaled.Dns
 
+	action := c.Param("action")
+
+	type PortRequest struct {
+		Servers []uint64 `json:"servers"`
+		Ports   []int    `json:"ports"`
+	}
+	type IngressConfig struct {
+		Hostname string `json:"hostname"`
+		Service  string `json:"service"`
+	}
+	type ServerResult struct {
+		ServerID uint64          `json:"server_id"`
+		Hostname string          `json:"hostname"`
+		IP       string          `json:"ip,omitempty"`
+		Ports    []int           `json:"ports"`
+		Ingress  []IngressConfig `json:"ingress"`
+		Status   []string        `json:"status"`
+		Error    string          `json:"error,omitempty"`
+	}
+
+	var req PortRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		return nil, err
+	}
+	if len(req.Servers) == 0 {
+		return nil, singleton.Localizer.ErrorT("servers list is required")
+	}
+	if len(req.Ports) == 0 {
+		return nil, singleton.Localizer.ErrorT("ports list is required")
+	}
+	if !singleton.ServerShared.CheckPermission(c, slices.Values(req.Servers)) {
+		return nil, singleton.Localizer.ErrorT("permission denied")
+	}
+
+	results := make([]ServerResult, 0, len(req.Servers))
+
+	for _, serverID := range req.Servers {
+		var s model.Server
+		if err := singleton.DB.First(&s, serverID).Error; err != nil {
+			results = append(results, ServerResult{
+				ServerID: serverID,
+				Ports:    req.Ports,
+				Error:    fmt.Sprintf("server id %d does not exist", serverID),
+			})
+			continue
+		}
+
+		hostname := s.ConfigDetail.Name
+		if parts := strings.Split(s.ConfigDetail.Name, "/"); len(parts) > 0 {
+			hostname = parts[len(parts)-1]
+		}
+
+		var ip string
+		if device, err := callTailscaleAPI(dns, tailscale_token, hostname); err == nil {
+			if addrs, ok := device["addresses"].([]interface{}); ok && len(addrs) > 0 {
+				if ipstr, ok := addrs[0].(string); ok {
+					ip = ipstr
+				}
+			}
+		}
+
+		// Bước 1: Lấy cấu hình ingress hiện tại
+		allconfig, err := callCloudflareAPI(cloudflare_token, accountid, tunnelid, "list", nil)
+		if err != nil {
+			results = append(results, ServerResult{
+				ServerID: serverID,
+				Hostname: hostname,
+				IP:       ip,
+				Ports:    req.Ports,
+				Error:    "Cloudflare get config: " + err.Error(),
+			})
+			continue
+		}
+
+		var cfResp map[string]interface{}
+		if err := json.Unmarshal(allconfig, &cfResp); err != nil {
+			results = append(results, ServerResult{
+				ServerID: serverID,
+				Hostname: hostname,
+				IP:       ip,
+				Ports:    req.Ports,
+				Error:    "Cloudflare parse config: " + err.Error(),
+			})
+			continue
+		}
+
+		result, ok := cfResp["result"].(map[string]interface{})
+		if !ok {
+			results = append(results, ServerResult{
+				ServerID: serverID,
+				Hostname: hostname,
+				IP:       ip,
+				Ports:    req.Ports,
+				Error:    "Cloudflare result format invalid",
+			})
+			continue
+		}
+
+		config, ok := result["config"].(map[string]interface{})
+		if !ok {
+			config = make(map[string]interface{})
+		}
+		ingressList, _ := config["ingress"].([]interface{})
+		ingressListNew := ingressList
+
+		if action == "list" {
+			filtered := []IngressConfig{}
+			for _, item := range ingressList {
+				if m, ok := item.(map[string]interface{}); ok {
+					if h, ok := m["hostname"].(string); ok && strings.Contains(h, hostname) {
+						svc, _ := m["service"].(string)
+						filtered = append(filtered, IngressConfig{
+							Hostname: h,
+							Service:  svc,
+						})
+					}
+				}
+			}
+			return filtered, nil
+		}
+		
+		// Bước 2: Xây dựng ingress mới
+		ingress := make([]IngressConfig, 0, len(req.Ports))
+		status := make([]string, 0, len(req.Ports))
+		ingressExisted := make(map[string]int) // hostname -> index
+		needUpdate := false
+
+		for idx, item := range ingressListNew {
+			if m, ok := item.(map[string]interface{}); ok {
+				if h, ok := m["hostname"].(string); ok {
+					ingressExisted[h] = idx
+				}
+			}
+		}
+
+		for _, port := range req.Ports {
+			newHost := fmt.Sprintf("%d-%s.googleidx.click", port, hostname)
+			newService := fmt.Sprintf("http://%s:%d", ip, port)
+
+			ingress = append(ingress, IngressConfig{
+				Hostname: newHost,
+				Service:  newService,
+			})
+
+			if idx, ok := ingressExisted[newHost]; ok {
+				if m, ok := ingressListNew[idx].(map[string]interface{}); ok {
+					oldService, _ := m["service"].(string)
+					if oldService != newService {
+						m["service"] = newService
+						ingressListNew[idx] = m
+						status = append(status, "đã cập nhật service")
+						needUpdate = true
+					} else {
+						status = append(status, "tồn tại (không đổi)")
+					}
+				}
+			} else {
+				// Thêm mới
+				entry := map[string]interface{}{
+					"hostname": newHost,
+					"service":  newService,
+				}
+				ingressListNew = append(ingressListNew, entry)
+				status = append(status, "đã thêm mới")
+				needUpdate = true
+			}
+		}
+
+		// Bước 3: Nếu có thay đổi thì cập nhật Cloudflare
+		var cfErr error
+		if needUpdate {
+			// Tách defaultRule nếu có
+			var defaultRule map[string]interface{}
+			var cleanedIngress []interface{}
+			for _, item := range ingressListNew {
+				if m, ok := item.(map[string]interface{}); ok {
+					if (m["hostname"] == nil || m["hostname"] == "") || m["service"] == "http_status:404" {
+						defaultRule = m
+						continue
+					}
+					cleanedIngress = append(cleanedIngress, m)
+				}
+			}
+			if defaultRule != nil {
+				cleanedIngress = append(cleanedIngress, defaultRule)
+			}
+
+			cfPayload := map[string]interface{}{
+				"config": map[string]interface{}{
+					"ingress": cleanedIngress,
+				},
+			}
+			payloadBytes, _ := json.Marshal(cfPayload)
+			_, cfErr = callCloudflareAPI(cloudflare_token, accountid, tunnelid, "create", bytes.NewReader(payloadBytes))
+		}
+
+		// Ghi kết quả
+		resultObj := ServerResult{
+			ServerID: serverID,
+			Hostname: hostname,
+			IP:       ip,
+			Ports:    req.Ports,
+			Ingress:  ingress,
+			Status:   status,
+		}
+		if cfErr != nil {
+			resultObj.Error = "Cloudflare: " + cfErr.Error()
+		}
+		results = append(results, resultObj)
+	}
+
+	return results, nil
+}
+
+
+//call API tailscale
+func callTailscaleAPI(tailnet, apiKey, targetHostname string) (map[string]interface{}, error) {
+	url := fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/devices", tailnet)
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+	
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error calling Tailscale API: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("Tailscale API error (status %d): %s", resp.StatusCode, string(body))
+	}
+	
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("error decoding response: %v", err)
+	}
+	
+	// Find device by hostname
+	devices, ok := result["devices"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("devices field not found in response")
+	}
+	
+	var targetDevice map[string]interface{}
+	for _, device := range devices {
+		if deviceMap, ok := device.(map[string]interface{}); ok {
+			if hostname, ok := deviceMap["hostname"].(string); ok && hostname == targetHostname {
+				targetDevice = deviceMap
+				break
+			}
+		}
+	}
+	
+	if targetDevice == nil {
+		return nil, fmt.Errorf("device with hostname '%s' not found", targetHostname)
+	}
+	
+	return targetDevice, nil
+}
+//call API cloudflared
+func callCloudflareAPI(cloudflare_token, accountid, tunnelid string, action string, body io.Reader) ([]byte, error) {
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/cfd_tunnel/%s/configurations", accountid, tunnelid)
+	method := "GET"
+	if action == "create" {
+		method = "PUT"		
+	}
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", cloudflare_token))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Cloudflare API error (status %d): %s", resp.StatusCode, string(responseBody))
+	}
+
+	return responseBody, nil
+}
 //API: GET /api/v1/oauth2/:provider/list
 func updateWorkstationList(c *gin.Context) (any, error) {
 	provider := strings.ToLower(c.Param("provider"))
