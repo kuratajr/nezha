@@ -260,6 +260,12 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 
 	action := c.Param("action")
 
+	validActions := map[string]bool{"list": true, "create": true}
+	
+	if !validActions[action] {
+		return nil, singleton.Localizer.ErrorT("invalid action. Supported actions: create, list")
+	}
+
 	type PortRequest struct {
 		Servers []uint64 `json:"servers"`
 		Ports   []int    `json:"ports"`
