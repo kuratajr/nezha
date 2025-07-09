@@ -48,6 +48,17 @@ type ConfigDashboard struct {
 	DNSServers string `koanf:"dns_servers" json:"dns_servers,omitempty"`
 }
 
+type CloudflaredConfig struct {
+    Token     string `koanf:"token" json:"token"`
+    AccountID string `koanf:"accountid" json:"accountid"`
+    TunnelID  string `koanf:"tunnelid" json:"tunnelid"`
+}
+
+type TailscaledConfig struct {
+	Token string `koanf:"token" json:"token"`
+	Dns   string `koanf:"dns" json:"dns"`
+}
+
 type Config struct {
 	ConfigForGuests
 	ConfigDashboard
@@ -67,6 +78,10 @@ type Config struct {
 	// oauth2 配置
 	Oauth2 map[string]*Oauth2Config `koanf:"oauth2" json:"oauth2,omitempty"`
 
+	// Thêm trường Cloudflared && Tailscaled
+	Cloudflared CloudflaredConfig `koanf:"cloudflared" json:"cloudflared"`
+	Tailscaled  TailscaledConfig `koanf:"tailscaled" json:"tailscaled"`	
+	
 	// HTTPS 配置
 	HTTPS HTTPSConf `koanf:"https" json:"https"`
 
