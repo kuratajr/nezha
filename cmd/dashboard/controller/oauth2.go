@@ -260,12 +260,6 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 
 	action := c.Param("action")
 
-	validActions := map[string]bool{"list": true, "create": true}
-	
-	if !validActions[action] {
-		return nil, singleton.Localizer.ErrorT("invalid action. Supported actions: create, list")
-	}
-
 	type PortRequest struct {
 		Servers []uint64 `json:"servers"`
 		Ports   []int    `json:"ports"`
@@ -325,7 +319,6 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 			}
 		}
 
-		// Bước 1: Lấy cấu hình ingress hiện tại
 		allconfig, err := callCloudflareAPI(cloudflare_token, accountid, tunnelid, "list", nil)
 		if err != nil {
 			results = append(results, ServerResult{
@@ -384,11 +377,10 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 			}
 			return filtered, nil
 		}
-		
-		// Bước 2: Xây dựng ingress mới
+
 		ingress := make([]IngressConfig, 0, len(req.Ports))
 		status := make([]string, 0, len(req.Ports))
-		ingressExisted := make(map[string]int) // hostname -> index
+		ingressExisted := make(map[string]int)
 		needUpdate := false
 
 		for idx, item := range ingressListNew {
@@ -399,6 +391,7 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 			}
 		}
 
+		newHostsSet := make(map[string]struct{})
 		for _, port := range req.Ports {
 			newHost := fmt.Sprintf("%d-%s.googleidx.click", port, hostname)
 			newService := fmt.Sprintf("http://%s:%d", ip, port)
@@ -407,6 +400,7 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 				Hostname: newHost,
 				Service:  newService,
 			})
+			newHostsSet[newHost] = struct{}{}
 
 			if idx, ok := ingressExisted[newHost]; ok {
 				if m, ok := ingressListNew[idx].(map[string]interface{}); ok {
@@ -421,7 +415,6 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 					}
 				}
 			} else {
-				// Thêm mới
 				entry := map[string]interface{}{
 					"hostname": newHost,
 					"service":  newService,
@@ -432,35 +425,54 @@ func openPortCloudflared(c *gin.Context) (any, error) {
 			}
 		}
 
-		// Bước 3: Nếu có thay đổi thì cập nhật Cloudflare
-		var cfErr error
-		if needUpdate {
-			// Tách defaultRule nếu có
-			var defaultRule map[string]interface{}
-			var cleanedIngress []interface{}
-			for _, item := range ingressListNew {
-				if m, ok := item.(map[string]interface{}); ok {
-					if (m["hostname"] == nil || m["hostname"] == "") || m["service"] == "http_status:404" {
-						defaultRule = m
-						continue
-					}
-					cleanedIngress = append(cleanedIngress, m)
+		// ✅ Xử lý xóa rule cũ và đảm bảo default rule nằm cuối
+		cleanedIngressList := make([]interface{}, 0)
+		var defaultRule map[string]interface{}
+
+		for _, item := range ingressListNew {
+			if m, ok := item.(map[string]interface{}); ok {
+				h, _ := m["hostname"].(string)
+				svc, _ := m["service"].(string)
+
+				// Nếu là default rule thì giữ lại sau
+				if h == "" && svc == "http_status:404" {
+					defaultRule = m
+					continue
+				}
+
+				// Nếu không phải rule của server hiện tại thì giữ lại
+				if !strings.Contains(h, hostname) {
+					cleanedIngressList = append(cleanedIngressList, m)
+					continue
+				}
+
+				// Nếu là rule của server hiện tại mà vẫn cần dùng → giữ lại
+				if _, exists := newHostsSet[h]; exists {
+					cleanedIngressList = append(cleanedIngressList, m)
+				} else {
+					status = append(status, fmt.Sprintf("đã xóa rule cũ %s", h))
+					needUpdate = true
 				}
 			}
-			if defaultRule != nil {
-				cleanedIngress = append(cleanedIngress, defaultRule)
-			}
+		}
 
+		// Append default rule vào cuối cùng
+		if defaultRule != nil {
+			cleanedIngressList = append(cleanedIngressList, defaultRule)
+		}
+		ingressListNew = cleanedIngressList
+
+		var cfErr error
+		if needUpdate {
 			cfPayload := map[string]interface{}{
 				"config": map[string]interface{}{
-					"ingress": cleanedIngress,
+					"ingress": ingressListNew,
 				},
 			}
 			payloadBytes, _ := json.Marshal(cfPayload)
 			_, cfErr = callCloudflareAPI(cloudflare_token, accountid, tunnelid, "create", bytes.NewReader(payloadBytes))
 		}
 
-		// Ghi kết quả
 		resultObj := ServerResult{
 			ServerID: serverID,
 			Hostname: hostname,
