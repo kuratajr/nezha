@@ -795,7 +795,7 @@ func getServerListFromBithub() (any, error) {
 	return result, nil
 }
 
-// API: GET /api/v1/oauth2/:provider/:action
+// API: GET /api/v1/oauth2/:provider/:action/:mode
 // action: start, stop, generateToken, list
 func getWorkstation(c *gin.Context) (any, error) {
 	provider := strings.ToLower(c.Param("provider"))
@@ -804,6 +804,7 @@ func getWorkstation(c *gin.Context) (any, error) {
     }
 	
 	action := c.Param("action")
+	mode := c.Param("mode")
 
 	var servers []uint64
 	var tokenexp int64
@@ -899,25 +900,20 @@ func getWorkstation(c *gin.Context) (any, error) {
 			defer wg.Done()
 			defer func() { <-sem }() // giải phóng slot
 
-			serverIdStr := fmt.Sprintf("%d", id)
-			body, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action, tokenexp, port)
-			if err != nil {
-				results[i] = Result{ID: id, Error: err.Error()}
-				return
-			}
-			var result any
-			if err := json.Unmarshal(body, &result); err != nil {
-				results[i] = Result{ID: id, Error: err.Error()}
-				return
-			}
-			results[i] = Result{ID: id, Result: result}
+					serverIdStr := fmt.Sprintf("%d", id)
+		result, err := callWorkstationAPI(c, newToken.AccessToken, serverIdStr, action, mode, tokenexp, port)
+		if err != nil {
+			results[i] = Result{ID: id, Error: err.Error()}
+			return
+		}
+		results[i] = Result{ID: id, Result: result}
 		}(i, id)
 	}
 	wg.Wait()
 	return results, nil
 }
 
-func callWorkstationAPI(c *gin.Context,accessToken, serverIdStr, action string, ttl, port int64) ([]byte, error) {
+func callWorkstationAPI(c *gin.Context,accessToken, serverIdStr, action, mode string, ttl, port int64) (map[string]interface{}, error) {
 	var url string
 	var method string
 	var body io.Reader
@@ -928,18 +924,45 @@ func callWorkstationAPI(c *gin.Context,accessToken, serverIdStr, action string, 
 		return nil, singleton.Localizer.ErrorT("invalid server id")
 	}
 	
-	var s model.Server
-	if err := singleton.DB.First(&s, serverId).Error; err != nil {
-		return nil, singleton.Localizer.ErrorT("server id %d does not exist", serverId)
+	var s interface{}
+	if mode == "serverlist" {
+		var serverList model.ServerList
+		if err := singleton.DB.First(&serverList, serverId).Error; err != nil {
+			return nil, singleton.Localizer.ErrorT("server list id %d does not exist", serverId)
+		}
+		s = &serverList
+	} else {
+		var server model.Server
+		if err := singleton.DB.First(&server, serverId).Error; err != nil {
+			return nil, singleton.Localizer.ErrorT("server id %d does not exist", serverId)
+		}
+		s = &server
 	}
 
-	if !s.HasPermission(c) {
-		return nil, singleton.Localizer.ErrorT("permission denied")
+	// Kiểm tra quyền truy cập
+	if server, ok := s.(*model.Server); ok {
+		if !server.HasPermission(c) {
+			return nil, singleton.Localizer.ErrorT("permission denied")
+		}
+	} else if serverList, ok := s.(*model.ServerList); ok {
+		if !serverList.HasPermission(c) {
+			return nil, singleton.Localizer.ErrorT("permission denied")
+		}
 	}
 	
-	serverUri := s.ConfigDetail.Name
-	currentAccessToken := s.ConfigDetail.Token
-	tokenExp := s.ConfigDetail.TokenExpiry
+	// Lấy thông tin cấu hình
+	var serverUri, currentAccessToken string
+	var tokenExp int64
+	
+	if server, ok := s.(*model.Server); ok {
+		serverUri = server.ConfigDetail.Name
+		currentAccessToken = server.ConfigDetail.Token
+		tokenExp = server.ConfigDetail.TokenExpiry
+	} else if serverList, ok := s.(*model.ServerList); ok {
+		serverUri = serverList.ConfigDetail.Name
+		currentAccessToken = serverList.ConfigDetail.Token
+		tokenExp = serverList.ConfigDetail.TokenExpiry
+	}
 	baseURL := "https://workstations.googleapis.com/v1beta/" + serverUri
 	
 	switch action {
@@ -965,11 +988,10 @@ func callWorkstationAPI(c *gin.Context,accessToken, serverIdStr, action string, 
 		// Generate access token for workstation
 		if tokenExp-time.Now().Unix() > 3600 && port == -1 {
 			expTime := time.Unix(tokenExp, 0).UTC()
-			resp := map[string]interface{}{
+			result := map[string]interface{}{
 				"accessToken": currentAccessToken,
 				"expireTime": expTime.Format(time.RFC3339Nano),          
 			}
-			result, _ := json.Marshal(resp)
 			return result, nil
 		}
 		url = fmt.Sprintf("%s:generateAccessToken", baseURL)
@@ -1015,34 +1037,61 @@ func callWorkstationAPI(c *gin.Context,accessToken, serverIdStr, action string, 
 		return nil, fmt.Errorf("Google Workstations API error (status %d): %s", resp.StatusCode, string(responseBody))
 	}
 	
+	// Parse response body
+	var apiResp map[string]interface{}
+	if err := json.Unmarshal(responseBody, &apiResp); err != nil {
+		return nil, err
+	}
+	
+	// Extract only done status for simple response
+	result := map[string]interface{}{
+		"done": apiResp["done"],
+	}
+	
 	if action == "token" && port == -1 {
 		var tokenResp map[string]interface{}
 		if err := json.Unmarshal(responseBody, &tokenResp); err != nil {
 			return nil, err
 		}
 
-		if accessToken, ok := tokenResp["accessToken"].(string); ok {
-			s.ConfigDetail.Token = accessToken
-		}
-		if expireTime, ok := tokenResp["expireTime"].(string); ok {
-			if parsedTime, err := time.Parse(time.RFC3339Nano, expireTime); err == nil {
-				s.ConfigDetail.TokenExpiry = parsedTime.Unix()
+		// Cập nhật token cho server hoặc server list
+		if server, ok := s.(*model.Server); ok {
+			if accessToken, ok := tokenResp["accessToken"].(string); ok {
+				server.ConfigDetail.Token = accessToken
+			}
+			if expireTime, ok := tokenResp["expireTime"].(string); ok {
+				if parsedTime, err := time.Parse(time.RFC3339Nano, expireTime); err == nil {
+					server.ConfigDetail.TokenExpiry = parsedTime.Unix()
+				}
+			}
+
+			// Lưu server vào database
+			if err := singleton.DB.Save(server).Error; err != nil {
+				return nil, newGormError("%v", err)
+			}
+		
+			// Cập nhật cache
+			rs, _ := singleton.ServerShared.Get(server.ID)
+			server.CopyFromRunningServer(rs)
+			singleton.ServerShared.Update(server, "")
+		} else if serverList, ok := s.(*model.ServerList); ok {
+			if accessToken, ok := tokenResp["accessToken"].(string); ok {
+				serverList.ConfigDetail.Token = accessToken
+			}
+			if expireTime, ok := tokenResp["expireTime"].(string); ok {
+				if parsedTime, err := time.Parse(time.RFC3339Nano, expireTime); err == nil {
+					serverList.ConfigDetail.TokenExpiry = parsedTime.Unix()
+				}
+			}
+
+			// Lưu server list vào database
+			if err := singleton.DB.Save(serverList).Error; err != nil {
+				return nil, newGormError("%v", err)
 			}
 		}
-
-		// Lưu server vào database
-		if err := singleton.DB.Save(&s).Error; err != nil {
-			return nil, newGormError("%v", err)
-		}
-	
-		// Cập nhật cache
-		rs, _ := singleton.ServerShared.Get(s.ID)
-		s.CopyFromRunningServer(rs)
-		singleton.ServerShared.Update(&s, "")
-
 	}
 	
-	return responseBody, nil
+	return result, nil
 }
 
 

@@ -116,7 +116,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.POST("/batch-move/server", commonHandler(batchMoveServer))
 	auth.POST("/force-update/server", commonHandler(forceUpdateServer))
 
-	auth.POST("/server/:provider/:action", commonHandler(getWorkstation))
+	auth.POST("/server/:provider/:action/:mode", commonHandler(getWorkstation))
 	auth.GET("/server/:provider/detail/:id", commonHandler(getWorkstationDetail))
 	auth.POST("/server/:provider/list", commonHandler(updateWorkstationList))
 	auth.POST("/server/port/:action", commonHandler(openPortCloudflared))
@@ -156,6 +156,20 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.POST("/online-user/batch-block", adminHandler(batchBlockOnlineUser))
 
 	auth.PATCH("/setting", adminHandler(updateConfig))
+
+	// ServerList routes
+	// auth.GET("/server-list", listHandler(listServerList))
+	auth.GET("/server-list", commonHandler(listServerListFiltered))
+	auth.GET("/server-list/:id", commonHandler(getServerListByID))
+	auth.POST("/server-list", commonHandler(createServerList))
+	auth.PATCH("/server-list/:id", commonHandler(updateServerList))
+	auth.DELETE("/server-list/:id", commonHandler(deleteServerList))
+	auth.GET("/server-list/user", commonHandler(getServerListsByUser))
+	
+	// Workstation routes
+	auth.POST("/server-list/sync-gcp/:provider", commonHandler(syncWorkstationsFromGCP))
+	auth.GET("/server-list/workstation/:id", commonHandler(getWorkstationDetailByID))
+	auth.POST("/server-list/update-gcp/:provider", commonHandler(updateWorkstationListFromGCP))
 
 	r.NoRoute(fallbackToFrontend(frontendDist))
 }
@@ -385,3 +399,4 @@ func fallbackToFrontend(frontendDist fs.FS) func(*gin.Context) {
 		}
 	}
 }
+
