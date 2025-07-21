@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -38,8 +39,15 @@ type ServerListFiltered struct {
 // @Success 200 {object} model.CommonResponse[[]ServerListFiltered]
 // @Router /server-list/filtered [get]
 func listServerListFiltered(c *gin.Context) ([]*ServerListFiltered, error) {
+	// Lấy user hiện tại từ context
+	user, exists := c.Get(model.CtxKeyAuthorizedUser)
+	if !exists {
+		return nil, errors.New("unauthorized: user not found in context")
+	}
+	userID := user.(*model.User).ID
+
 	var serverLists []*model.ServerList
-	err := singleton.DB.Find(&serverLists).Error
+	err := singleton.DB.Where("user_id = ?", userID).Find(&serverLists).Error
 	if err != nil {
 		return nil, err
 	}
@@ -51,17 +59,14 @@ func listServerListFiltered(c *gin.Context) ([]*ServerListFiltered, error) {
 			Name: serverList.Name,
 			Host: serverList.ConfigDetail.Host,
 		}
-		
 		// Lấy CREATOR_EMAIL từ ConfigDetail.Env
 		if serverList.ConfigDetail.Env != nil {
 			if creatorEmail, exists := serverList.ConfigDetail.Env["CREATOR_EMAIL"]; exists {
 				filteredItem.CreatorEmail = creatorEmail
 			}
 		}
-		
 		filtered = append(filtered, filteredItem)
 	}
-	
 	return filtered, nil
 }
 
@@ -195,20 +200,18 @@ func updateServerList(c *gin.Context) (any, error) {
 // @Success 200 {object} model.CommonResponse[any]
 // @Router /server-list/{id} [delete]
 func deleteServerList(c *gin.Context) (any, error) {
-	idStr := c.Param("id")
-	id, err := strconv.ParseUint(idStr, 10, 64)
-	if err != nil {
-		return nil, err
-	}
+    var servers []uint64
+    if err := c.ShouldBindJSON(&servers); err != nil {
+        return nil, err
+    }
 
-	err = singleton.DB.Delete(&model.ServerList{}, id).Error
-	if err != nil {
-		return nil, err
-	}
+    err := singleton.DB.Delete(&model.ServerList{}, servers).Error
+    if err != nil {
+        return nil, err
+    }
 
-	return nil, nil
+    return nil, nil
 }
-
 // Get server lists by user
 // @Summary Get server lists by user
 // @Security BearerAuth
@@ -419,7 +422,7 @@ func updateWorkstationListFromGCP(c *gin.Context) (any, error) {
 	}()
 
 	return map[string]interface{}{
-		"message": "Update workstation list đã được khởi chạy trong background",
+		"message": "Update workstation list",
 		"user_id": u.ID,
 		"status":  "started",
 	}, nil
