@@ -11,4 +11,5 @@ type CronForm struct {
 	NotificationGroupID uint64   `json:"notification_group_id,omitempty"`
 	Action              string   `json:"action,omitempty"`             // 是否启用
 	UID                 uint64   `json:"user_id,omitempty"`            // 创建者ID
+	BatchType           string   `json:"batch_type,omitempty"`         // 批量类型: server, serverlist, both
 }

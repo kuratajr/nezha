@@ -75,6 +75,10 @@ type Config struct {
 	ListenPort   uint16 `koanf:"listen_port" json:"listen_port,omitempty"`
 	ListenHost   string `koanf:"listen_host" json:"listen_host,omitempty"`
 
+	// Database encryption settings
+	DatabaseEncryption bool   `koanf:"database_encryption" json:"database_encryption,omitempty"` // Enable database encryption
+	DatabasePassword   string `koanf:"database_password" json:"database_password,omitempty"`     // Database encryption password
+
 	// oauth2 配置
 	Oauth2 map[string]*Oauth2Config `koanf:"oauth2" json:"oauth2,omitempty"`
 
@@ -84,6 +88,9 @@ type Config struct {
 	
 	// HTTPS 配置
 	HTTPS HTTPSConf `koanf:"https" json:"https"`
+
+	// Giữ lại workstation cũ khi đồng bộ (nếu true sẽ không xóa các bản ghi không còn trong GCP)
+	KeepOldWorkstations bool `koanf:"keep_old_workstations" json:"keep_old_workstations,omitempty"`
 
 	k        *koanf.Koanf `json:"-"`
 	filePath string       `json:"-"`
