@@ -21,6 +21,8 @@ import (
     "golang.org/x/oauth2/google"
 	"encoding/json"
 	"sync"
+	"crypto/tls"
+	"net/url"
 )
 
 type CronClass struct {
@@ -212,8 +214,9 @@ func CronTrigger(cr *model.Cron, triggerServer ...uint64) func() {
 			}
 		}
 
+		processInBatchesByType(cr, crIgnoreMap, bind, cr.BatchType)
 		// Process servers in batches
-		processServersInBatches(cr, crIgnoreMap, bind)
+		// processServersInBatches(cr, crIgnoreMap, bind)
 	}
 }
 
@@ -247,6 +250,67 @@ func processServersInBatches(cr *model.Cron, crIgnoreMap map[uint64]bool, bind m
 		}
 		wg.Wait() // Wait for all servers in this batch to finish
 	}
+}
+
+func processInBatchesByType(
+    cr *model.Cron,
+    crIgnoreMap map[uint64]bool,
+    bind model.Oauth2Bind,
+    batchType string, 
+) {
+	
+    if batchType == "server" {
+        var servers []*model.Server
+        ServerShared.Range(func(k uint64, v *model.Server) bool {
+            servers = append(servers, v)
+            return true
+        })
+        processInBatches(servers, func(server *model.Server) {
+            processServerBatch(cr, server, crIgnoreMap, bind)
+        })
+    }
+
+    if batchType == "serverlist"{
+		// Lấy danh sách ID từ crIgnoreMap
+		var ids []uint64
+		for id := range crIgnoreMap {
+			ids = append(ids, id)
+		}
+
+		// Lấy các ServerList có ID trong danh sách này từ DB
+		var serverLists []*model.ServerList
+		if len(ids) > 0 {
+			if err := DB.Where("id IN ?", ids).Find(&serverLists).Error; err != nil {
+				return
+			}
+		}
+
+        processInBatches(serverLists, func(serverList *model.ServerList) {
+            processServerListBatch(cr, serverList, crIgnoreMap, bind)
+        })
+    }
+}
+
+func processInBatches[T any](items []T, handler func(T)) {
+    total := len(items)
+    numBatches := (total + BATCH_SIZE - 1) / BATCH_SIZE
+    for i := 0; i < numBatches; i++ {
+        start := i * BATCH_SIZE
+        end := start + BATCH_SIZE
+        if end > total {
+            end = total
+        }
+        batch := items[start:end]
+        var wg sync.WaitGroup
+        for _, item := range batch {
+            wg.Add(1)
+            go func(it T) {
+                defer wg.Done()
+                handler(it)
+            }(item)
+        }
+        wg.Wait()
+    }
 }
 
 // processServerBatch processes a single server (not a batch anymore)
@@ -386,44 +450,146 @@ func processServerBatch(cr *model.Cron, s *model.Server, crIgnoreMap map[uint64]
 	}
 }
 
+
+func processServerListBatch(cr *model.Cron, s *model.ServerList, crIgnoreMap map[uint64]bool, bind model.Oauth2Bind) {
+	fmt.Println("[", time.Now().Format(time.RFC3339), "] Action:", cr.Action)
+
+	baseURL := "https://workstations.googleapis.com/v1beta/" + s.ConfigDetail.Name
+	var url, method string
+	var body io.Reader
+
+	if cr.Action == "live" {
+		var currentAccessToken string
+		tokenExp := s.ConfigDetail.TokenExpiry
+	
+		if tokenExp-time.Now().Unix() > 3600  {
+			currentAccessToken = s.ConfigDetail.Token
+		} else {
+			url = fmt.Sprintf("%s:generateAccessToken", baseURL)
+			method = "POST"
+			requestBody := map[string]string{
+				"ttl": fmt.Sprintf("%ds", 24*3600),
+			}
+			bodyBytes, err := json.Marshal(requestBody)
+			if err != nil {
+				return
+			}
+			body = strings.NewReader(string(bodyBytes))
+			req1, err := http.NewRequest(method, url, body)
+			if err != nil {
+				return
+			}
+			req1.Header.Set("Authorization", "Bearer "+bind.AccessToken)
+			req1.Header.Set("Content-Type", "application/json")
+			client1 := &http.Client{}
+			resp1, err := client1.Do(req1)
+			if err != nil {
+				return
+			}
+			defer resp1.Body.Close()
+			responseBody, err := io.ReadAll(resp1.Body)
+			if err != nil {
+				return
+			}
+			var respData map[string]interface{}
+			err = json.Unmarshal(responseBody, &respData)
+			if err != nil {
+				return
+			}
+			if at, ok := respData["accessToken"].(string); ok {
+				currentAccessToken = at
+				s.ConfigDetail.Token = at		
+			} else {
+				return
+			}
+			if exp, ok := respData["expireTime"].(string); ok {
+				expTime, err := time.Parse(time.RFC3339Nano, exp)
+				if err != nil {
+					return
+				}
+				s.ConfigDetail.TokenExpiry = expTime.Unix()
+
+			} else {
+				return
+			}
+			// Cập nhật lại thông tin token và thời gian hết hạn vào DB
+			if err := DB.Save(&s).Error; err != nil {
+				return
+			}
+		}
+		
+		callWorkStationLive(s.ConfigDetail.Name, s.ConfigDetail.Host, currentAccessToken, bind.AccessToken)
+	}
+	// If the action is "start", we will start the workstation
+	if cr.Action == "start" {
+		url = fmt.Sprintf("%s:start", baseURL)
+		method = "POST"
+		body = nil
+
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			return
+		}
+
+		req.Header.Set("Authorization", "Bearer "+ bind.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+	}
+	// If the action is "stop", we send a stop request
+	if cr.Action == "stop" {
+		url = fmt.Sprintf("%s:stop", baseURL)
+		method = "POST"
+		body = nil
+
+		req, err := http.NewRequest(method, url, body)
+		if err != nil {
+			return
+		}
+
+		req.Header.Set("Authorization", "Bearer "+ bind.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+	}
+
+	if cr.Cover == model.CronCoverAll && crIgnoreMap[s.ID] {
+		return
+	}
+	if cr.Cover == model.CronCoverIgnoreAll && !crIgnoreMap[s.ID] {
+		return
+	}
+}
+
 func callWorkStationLive(name, hostname, token, accessToken string) {
 	var url string
 	var method string
 	var body io.Reader
 
-	workstationUrl := "https://" + hostname + "/vnc.html?autoconnect=true&resize=remote&_=" + time.Now().Format(time.RFC3339)
+	workstationUrl := "https://" + hostname + "/vnc.html?autoconnect=true&resize=remote"
 	workspaceUrl := "https://workstations.googleapis.com/v1beta/" + name
-
-	url = workstationUrl
-	method = "GET"
-	body = nil
-
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return
-	}
-
-	req.Header.Set("Cookie", "WorkstationJwtPartitioned="+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	// responseBody, err := io.ReadAll(resp.Body)
 	
-	// if err != nil {
-	// 	return
-	// }
-
-	if resp.StatusCode < 200 {
+	statusCode, err := callRedirect(workstationUrl, token)
+	if err != nil {
 		return
 	}
 
-	if resp.StatusCode == 404 {
+	if statusCode < 200 {
+		return
+	}
+
+	if statusCode == 404 {
 
 		url = fmt.Sprintf("%s:start", workspaceUrl)	
 		method = "POST"
@@ -440,15 +606,71 @@ func callWorkStationLive(name, hostname, token, accessToken string) {
 		client1 := &http.Client{}
 		resp1, err := client1.Do(req1)
 
-		fmt.Println("start workstation:", resp1.StatusCode)
-
 		if err != nil {
 			return
 		}
 		defer resp1.Body.Close()		
 	}
 
-	fmt.Println("Live workstation:", resp.StatusCode)	
+	fmt.Println("Live workstation:", statusCode)	
 
 	return
+}
+
+func callRedirect(urlStr, token string) (int, error) {
+    workstationUrl := urlStr
+
+    // Custom HTTP client để không tự redirect
+    client := &http.Client{
+        CheckRedirect: func(req *http.Request, via []*http.Request) error {
+            return http.ErrUseLastResponse // Ngăn redirect tự động
+        },
+        Transport: &http.Transport{
+            TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+        },
+    }
+
+    req, err := http.NewRequest("GET", workstationUrl, nil)
+    if err != nil {
+        return 0, err
+    }
+    req.Header.Set("Cookie", "WorkstationJwtPartitioned="+token)
+    req.Header.Set("Content-Type", "application/json")
+
+    // Gửi request ban đầu
+    resp, err := client.Do(req)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+
+    // Kiểm tra có redirect không
+    if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
+        location := resp.Header.Get("Location")
+        if location == "" {
+            return resp.StatusCode, nil
+        }
+        redirectURL, err := url.Parse(location)
+        if err != nil {
+            return resp.StatusCode, err
+        }
+        // Gửi lại request đến địa chỉ mới
+        req2, err := http.NewRequest("GET", redirectURL.String(), nil)
+        if err != nil {
+            return resp.StatusCode, err
+        }
+        req2.Header.Set("Cookie", "WorkstationJwtPartitioned="+token)
+        req2.Header.Set("Content-Type", "application/json")
+
+        resp2, err := client.Do(req2)
+        if err != nil {
+            return resp.StatusCode, err
+        }
+        defer resp2.Body.Close()
+
+        return resp2.StatusCode, nil
+
+    } else {
+        return resp.StatusCode, nil
+    }
 }
