@@ -163,7 +163,7 @@ func routers(r *gin.Engine, frontendDist fs.FS) {
 	auth.GET("/server-list/:id", commonHandler(getServerListByID))
 	auth.POST("/server-list", commonHandler(createServerList))
 	auth.PATCH("/server-list/:id", commonHandler(updateServerList))
-	auth.DELETE("/server-list/:id", commonHandler(deleteServerList))
+	auth.POST("/batch-delete/serverlist", commonHandler(deleteServerList))
 	auth.GET("/server-list/user", commonHandler(getServerListsByUser))
 	
 	// Workstation routes
