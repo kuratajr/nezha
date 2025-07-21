@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nezhahq/nezha/model"
+	"sync/atomic"
 )
 
 const (
@@ -113,7 +114,6 @@ func (ws *WorkstationService) fetchCluster(projectID, clusterID, location string
 
 			resp, err := ws.client.Do(req)
 			if err != nil {
-				fmt.Printf("❌ Retry\n")
 				if attempt < MaxRetries {
 					time.Sleep(time.Duration(1<<attempt) * time.Second)
 					continue
@@ -273,73 +273,113 @@ func (ws *WorkstationService) SyncWorkstationsToDatabase(userID uint64) error {
 
 	// Tạo map để theo dõi workstations đã xử lý
 	processedUIDs := make(map[string]bool)
-	var createdCount, updatedCount int
+	var createdCount, updatedCount int32
 
-	// Xử lý từng workstation
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	maxConcurrent := 20
+	sem := make(chan struct{}, maxConcurrent)
+	errors := make(chan error, len(workstations))
+
 	for _, workstation := range workstations {
-		configDetail := model.ConfigDetail{
-			Name:         workstation.Name,
-			DisplayName:  workstation.DisplayName,
-			Uid:          workstation.Uid,
-			Annotations:  workstation.Annotations,
-			CreateTime:   workstation.CreateTime,
-			UpdateTime:   workstation.UpdateTime,
-			Etag:         workstation.Etag,
-			State:        workstation.State,
-			Host:         workstation.Host,
-			Env:          workstation.Env,
-			StartTime:    workstation.StartTime,
-			SatisfiesPzi: workstation.SatisfiesPzi,
-			RuntimeHost:  workstation.RuntimeHost,
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(workstation Workstation) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		if existingServerList, exists := existingMap[workstation.Uid]; exists {
-			// Cập nhật workstation đã tồn tại
-			existingServerList.Name = workstation.Annotations["IDX_WORKSPACE"]
-			existingServerList.ConfigDetail = configDetail
-			existingServerList.UpdatedAt = time.Now()
-
-			if err := DB.Save(&existingServerList).Error; err != nil {
-				return err
-			}
-			updatedCount++
-		} else {
-			// Tạo workstation mới
-			serverList := model.ServerList{
-				Common: model.Common{
-					UserID: userID,
-				},
-				Name:         workstation.Annotations["IDX_WORKSPACE"],
-				ConfigDetail: configDetail,
+			configDetail := model.ConfigDetail{
+				Name:         workstation.Name,
+				DisplayName:  workstation.DisplayName,
+				Uid:          workstation.Uid,
+				Annotations:  workstation.Annotations,
+				CreateTime:   workstation.CreateTime,
+				UpdateTime:   workstation.UpdateTime,
+				Etag:         workstation.Etag,
+				State:        workstation.State,
+				Host:         workstation.Host,
+				Env:          workstation.Env,
+				StartTime:    workstation.StartTime,
+				SatisfiesPzi: workstation.SatisfiesPzi,
+				RuntimeHost:  workstation.RuntimeHost,
 			}
 
-			if err := DB.Create(&serverList).Error; err != nil {
-				return err
-			}
-			createdCount++
-		}
+			mu.Lock()
+			existingServerList, exists := existingMap[workstation.Uid]
+			mu.Unlock()
 
-		processedUIDs[workstation.Uid] = true
+			if exists {
+				if Conf.KeepOldWorkstations {
+					// Nếu giữ nguyên, không cập nhật gì cả
+					mu.Lock()
+					processedUIDs[workstation.Uid] = true
+					mu.Unlock()
+					return
+				}
+				// Cập nhật workstation đã tồn tại
+				existingServerList.Name = workstation.Annotations["IDX_WORKSPACE"]
+				existingServerList.ConfigDetail = configDetail
+				existingServerList.UpdatedAt = time.Now()
+
+				if err := DB.Save(&existingServerList).Error; err != nil {
+					errors <- err
+					return
+				}
+				atomic.AddInt32(&updatedCount, 1)
+			} else {
+				// Tạo workstation mới
+				serverList := model.ServerList{
+					Common: model.Common{
+						UserID: userID,
+					},
+					Name:         workstation.Annotations["IDX_WORKSPACE"],
+					ConfigDetail: configDetail,
+				}
+
+				if err := DB.Create(&serverList).Error; err != nil {
+					errors <- err
+					return
+				}
+				atomic.AddInt32(&createdCount, 1)
+			}
+			mu.Lock()
+			processedUIDs[workstation.Uid] = true
+			mu.Unlock()
+		}(workstation)
 	}
+	wg.Wait()
+	close(errors)
 
-	// Xóa các workstations không còn tồn tại trong GCP
-	var workstationsToDelete []uint64
-	for _, existingServerList := range existingServerLists {
-		if !processedUIDs[existingServerList.ConfigDetail.Uid] {
-			workstationsToDelete = append(workstationsToDelete, existingServerList.ID)
-		}
-	}
-
-	if len(workstationsToDelete) > 0 {
-		if err := DB.Delete(&model.ServerList{}, workstationsToDelete).Error; err != nil {
+	for err := range errors {
+		if err != nil {
 			return err
 		}
+	}
+
+	// Xóa các workstations không còn tồn tại trong GCP nếu cấu hình cho phép
+	if !Conf.KeepOldWorkstations {
+		var workstationsToDelete []uint64
+		for _, existingServerList := range existingServerLists {
+			mu.Lock()
+			if !processedUIDs[existingServerList.ConfigDetail.Uid] {
+				workstationsToDelete = append(workstationsToDelete, existingServerList.ID)
+			}
+			mu.Unlock()
+		}
+
+		if len(workstationsToDelete) > 0 {
+			if err := DB.Delete(&model.ServerList{}, workstationsToDelete).Error; err != nil {
+				return err
+			}
+		}
+		fmt.Printf("   - Xóa: %d\n", len(workstationsToDelete))
+	} else {
+		fmt.Printf("   - Không xóa workstation cũ do cấu hình KeepOldWorkstations=true\n")
 	}
 
 	fmt.Printf("✅ Đã đồng bộ %d workstations vào database cho user %d\n", len(workstations), userID)
 	fmt.Printf("   - Tạo mới: %d\n", createdCount)
 	fmt.Printf("   - Cập nhật: %d\n", updatedCount)
-	fmt.Printf("   - Xóa: %d\n", len(workstationsToDelete))
 
 	return nil
 } 
