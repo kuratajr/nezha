@@ -19,7 +19,7 @@ jobs:
     name: Build artifacts
     runs-on: ubuntu-latest
     container:
-      image: goreleaser/goreleaser-cross:v1.24
+      image: goreleaser/goreleaser-cross:v1.24.5
     steps:
       - run: |
           apt update && apt install unzip curl -y
