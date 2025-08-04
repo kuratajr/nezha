@@ -32,6 +32,7 @@ jobs:
 
       - name: Prepare frontends' dists
         run: |
+          apt update && apt install unzip curl -y
           chmod +x ./script/fetch-frontends.sh && ./script/fetch-frontends.sh
 
       - name: Fetch IPInfo GeoIP Database
