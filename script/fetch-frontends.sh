@@ -16,8 +16,6 @@ download_and_extract() {
   echo "Downloading from repository: $repository, version: $version"
 
   pushd "$TMP_DIR" || exit
-  
-  apt update && apt install -y unzip curl
 
   curl -L -o "dist.zip" "$repository/releases/download/$version/dist.zip"
 
