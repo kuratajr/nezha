@@ -577,7 +577,7 @@ func callWorkStationLive(name, hostname, token, accessToken string) {
 	var method string
 	var body io.Reader
 
-	workstationUrl := "https://" + hostname + "/vnc.html?autoconnect=true&resize=remote"
+	workstationUrl := "https://" + hostname + "?time"
 	workspaceUrl := "https://workstations.googleapis.com/v1beta/" + name
 	
 	statusCode, err := callRedirect(workstationUrl, token)
